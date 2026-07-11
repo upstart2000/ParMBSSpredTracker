@@ -97,10 +97,15 @@ def backfill_month(yyyymm, db_path=db.DEFAULT_DB_PATH, skip_existing=True):
 
             if record["ust_stale"]:
                 logger.warning("%s: treasury rate unavailable (no same-day data from either source)", finra_date)
-            if record["par_coupon"] is None:
+            if record["par_coupon_raw"] is None:
                 logger.warning(
-                    "%s: par coupon not computable (settlement_month=%s, no valid interpolation bracket)",
+                    "%s: raw par coupon not computable (settlement_month=%s, no valid interpolation bracket)",
                     finra_date, record["settlement_month"],
+                )
+            if record["par_coupon_normalized"] is None:
+                logger.warning(
+                    "%s: normalized par coupon not computable (near=%s, next=%s)",
+                    finra_date, record["settlement_month"], record["next_settlement_month"],
                 )
         except Exception:
             logger.exception("%s: failed to process, skipping", name)

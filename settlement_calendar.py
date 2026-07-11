@@ -63,6 +63,26 @@ def get_near_month_settlement(parsed_coupon_data, today=None, settlement_dates=N
     return None, None
 
 
+def get_next_settlement_month(month_label, settlement_dates=None):
+    """
+    Returns the month label whose settlement date immediately follows
+    month_label's, within settlement_dates (defaults to
+    CLASS_A_SETTLEMENT_DATES_2026). Used by the constant-maturity
+    normalization, which interpolates between the near and next settlement
+    month's prices. Returns None if month_label isn't in settlement_dates or
+    is the last one covered (e.g. December, with no 2027 calendar yet).
+    """
+    if settlement_dates is None:
+        settlement_dates = CLASS_A_SETTLEMENT_DATES_2026
+    if month_label not in settlement_dates:
+        return None
+    ordered_labels = [m for m, _ in sorted(settlement_dates.items(), key=lambda kv: kv[1])]
+    idx = ordered_labels.index(month_label)
+    if idx + 1 >= len(ordered_labels):
+        return None
+    return ordered_labels[idx + 1]
+
+
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, "/home/claude/mbs_tracker")

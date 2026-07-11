@@ -2,20 +2,30 @@
 SQLite storage for daily MBS/Treasury spread data.
 
 One row per trading day (keyed on the FINRA file's trade date), holding the
-UST 5yr/10yr rates, the UMBS interpolation bracket (coupon/price on each
-side of par), the interpolated par coupon, and the resulting spreads in bps.
+UST 5yr/10yr rates and two parallel par-coupon/spread series:
 
-spread_5yr  = (par_coupon - ust_5yr)  * 100   # bps
-spread_10yr = (par_coupon - ust_10yr) * 100   # bps
-spread_avg  = (spread_5yr + spread_10yr) / 2  # bps
+- "_raw": uses whichever settlement month is nearest today (as originally
+  built). This naturally drifts as days-to-settlement shrink toward the next
+  roll, then jumps at the roll - a sawtooth artifact layered on top of real
+  spread movement.
+- "_normalized": interpolates between the near-month and next-month prices
+  (per coupon bucket) to a fixed TARGET_DAYS_TO_SETTLEMENT-day horizon (see
+  pipeline.py), removing that artifact. This is an addition alongside the
+  raw series, not a replacement.
+
+spread_5yr_raw  = (par_coupon_raw - ust_5yr)  * 100   # bps
+spread_10yr_raw = (par_coupon_raw - ust_10yr) * 100   # bps
+spread_avg_raw  = (spread_5yr_raw + spread_10yr_raw) / 2
+(same formulas for the _normalized columns, using par_coupon_normalized)
 
 Quarter-to-date (QTD) change tracking: each row also stores its change since
 the most recent row dated before the first day of its quarter (i.e. the prior
 quarter's last available close) - used to estimate rate-driven book value
 moves intra-quarter, before official financials post. All QTD deltas are in
 bps (including the UST yield changes, for unit consistency with the spreads).
-A row in the first quarter a dataset covers has no prior-quarter baseline
-available, so its QTD fields are NULL - not a bug, just no reference point.
+QTD is tracked for both the raw and normalized spread series. A row in the
+first quarter a dataset covers has no prior-quarter baseline available, so
+its QTD fields are NULL - not a bug, just no reference point.
 """
 import sqlite3
 from contextlib import contextmanager
@@ -26,25 +36,43 @@ DEFAULT_DB_PATH = "mbs_spreads.db"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS daily_spreads (
     finra_date      TEXT PRIMARY KEY,   -- ISO date (YYYY-MM-DD), FINRA file's trade date
-    settlement_month TEXT,              -- near-month settlement label used (e.g. "August")
+    settlement_month TEXT,              -- near-month settlement label (used for the _raw series)
+    next_settlement_month TEXT,         -- next settlement month (the normalization's "next" leg)
+    days_to_near    INTEGER,            -- calendar days from finra_date to near-month settlement
+    days_to_next    INTEGER,            -- calendar days from finra_date to next-month settlement
     ust_5yr         REAL,
     ust_10yr        REAL,
     ust_source      TEXT,               -- 'treasury.gov' | 'yahoo_fallback' | NULL
     ust_stale       INTEGER NOT NULL DEFAULT 0,  -- 1 if no same-day treasury rate was available
-    coupon_low      REAL,
-    price_low       REAL,
-    coupon_high     REAL,
-    price_high      REAL,
-    par_coupon      REAL,
-    spread_5yr      REAL,               -- bps
-    spread_10yr     REAL,               -- bps
-    spread_avg      REAL,               -- bps
+
+    coupon_low_raw      REAL,
+    price_low_raw       REAL,
+    coupon_high_raw     REAL,
+    price_high_raw      REAL,
+    par_coupon_raw      REAL,
+    spread_5yr_raw      REAL,           -- bps
+    spread_10yr_raw     REAL,           -- bps
+    spread_avg_raw      REAL,           -- bps
+
+    coupon_low_normalized      REAL,
+    price_low_normalized       REAL,
+    coupon_high_normalized     REAL,
+    price_high_normalized      REAL,
+    par_coupon_normalized      REAL,
+    spread_5yr_normalized      REAL,    -- bps
+    spread_10yr_normalized     REAL,    -- bps
+    spread_avg_normalized      REAL,    -- bps
+
     qtd_ref_date    TEXT,               -- date of the prior-quarter reference row used below (NULL if none)
-    qtd_chg_ust_5yr      REAL,          -- bps, vs qtd_ref_date
-    qtd_chg_ust_10yr     REAL,          -- bps, vs qtd_ref_date
-    qtd_chg_spread_5yr   REAL,          -- bps, vs qtd_ref_date
-    qtd_chg_spread_10yr  REAL,          -- bps, vs qtd_ref_date
-    qtd_chg_spread_avg   REAL,          -- bps, vs qtd_ref_date
+    qtd_chg_ust_5yr                 REAL,  -- bps, vs qtd_ref_date
+    qtd_chg_ust_10yr                REAL,  -- bps, vs qtd_ref_date
+    qtd_chg_spread_5yr_raw          REAL,  -- bps, vs qtd_ref_date
+    qtd_chg_spread_10yr_raw         REAL,  -- bps, vs qtd_ref_date
+    qtd_chg_spread_avg_raw          REAL,  -- bps, vs qtd_ref_date
+    qtd_chg_spread_5yr_normalized   REAL,  -- bps, vs qtd_ref_date
+    qtd_chg_spread_10yr_normalized  REAL,  -- bps, vs qtd_ref_date
+    qtd_chg_spread_avg_normalized   REAL,  -- bps, vs qtd_ref_date
+
     ingested_at     TEXT NOT NULL       -- UTC timestamp this row was last written
 );
 """
@@ -69,7 +97,9 @@ def init_db(db_path=DEFAULT_DB_PATH):
 def compute_spreads(par_coupon, ust_5yr, ust_10yr):
     """
     Returns (spread_5yr, spread_10yr, spread_avg) in bps, or (None, None, None)
-    if any required input is missing.
+    if any required input is missing. Generic over which par coupon series
+    (raw or normalized) is passed in - callers assign the results to the
+    appropriately-suffixed fields.
     """
     if par_coupon is None or ust_5yr is None or ust_10yr is None:
         return None, None, None
@@ -107,20 +137,26 @@ def compute_qtd_fields(record, db_path=DEFAULT_DB_PATH):
     """
     Given a record dict (as built by pipeline.build_daily_record, pre-upsert),
     returns the qtd_ref_date / qtd_chg_* fields to merge into it. All deltas
-    are today's value minus the reference row's value, in bps. Any field is
-    None if either side of the comparison is missing (no reference row, or
-    the metric itself wasn't computable that day).
+    are today's value minus the reference row's value, in bps. Tracks both
+    the raw and normalized spread series. Any field is None if either side of
+    the comparison is missing (no reference row, or the metric itself wasn't
+    computable that day).
     """
+    empty = {
+        "qtd_ref_date": None,
+        "qtd_chg_ust_5yr": None,
+        "qtd_chg_ust_10yr": None,
+        "qtd_chg_spread_5yr_raw": None,
+        "qtd_chg_spread_10yr_raw": None,
+        "qtd_chg_spread_avg_raw": None,
+        "qtd_chg_spread_5yr_normalized": None,
+        "qtd_chg_spread_10yr_normalized": None,
+        "qtd_chg_spread_avg_normalized": None,
+    }
+
     ref = get_qtd_reference_row(record["finra_date"], db_path=db_path)
     if ref is None:
-        return {
-            "qtd_ref_date": None,
-            "qtd_chg_ust_5yr": None,
-            "qtd_chg_ust_10yr": None,
-            "qtd_chg_spread_5yr": None,
-            "qtd_chg_spread_10yr": None,
-            "qtd_chg_spread_avg": None,
-        }
+        return empty
 
     def _delta_bps(today_val, ref_val, already_bps):
         if today_val is None or ref_val is None:
@@ -132,10 +168,33 @@ def compute_qtd_fields(record, db_path=DEFAULT_DB_PATH):
         "qtd_ref_date": ref["finra_date"],
         "qtd_chg_ust_5yr": _delta_bps(record.get("ust_5yr"), ref.get("ust_5yr"), already_bps=False),
         "qtd_chg_ust_10yr": _delta_bps(record.get("ust_10yr"), ref.get("ust_10yr"), already_bps=False),
-        "qtd_chg_spread_5yr": _delta_bps(record.get("spread_5yr"), ref.get("spread_5yr"), already_bps=True),
-        "qtd_chg_spread_10yr": _delta_bps(record.get("spread_10yr"), ref.get("spread_10yr"), already_bps=True),
-        "qtd_chg_spread_avg": _delta_bps(record.get("spread_avg"), ref.get("spread_avg"), already_bps=True),
+        "qtd_chg_spread_5yr_raw": _delta_bps(record.get("spread_5yr_raw"), ref.get("spread_5yr_raw"), already_bps=True),
+        "qtd_chg_spread_10yr_raw": _delta_bps(record.get("spread_10yr_raw"), ref.get("spread_10yr_raw"), already_bps=True),
+        "qtd_chg_spread_avg_raw": _delta_bps(record.get("spread_avg_raw"), ref.get("spread_avg_raw"), already_bps=True),
+        "qtd_chg_spread_5yr_normalized": _delta_bps(
+            record.get("spread_5yr_normalized"), ref.get("spread_5yr_normalized"), already_bps=True
+        ),
+        "qtd_chg_spread_10yr_normalized": _delta_bps(
+            record.get("spread_10yr_normalized"), ref.get("spread_10yr_normalized"), already_bps=True
+        ),
+        "qtd_chg_spread_avg_normalized": _delta_bps(
+            record.get("spread_avg_normalized"), ref.get("spread_avg_normalized"), already_bps=True
+        ),
     }
+
+
+_COLUMNS = [
+    "finra_date", "settlement_month", "next_settlement_month", "days_to_near", "days_to_next",
+    "ust_5yr", "ust_10yr", "ust_source", "ust_stale",
+    "coupon_low_raw", "price_low_raw", "coupon_high_raw", "price_high_raw", "par_coupon_raw",
+    "spread_5yr_raw", "spread_10yr_raw", "spread_avg_raw",
+    "coupon_low_normalized", "price_low_normalized", "coupon_high_normalized", "price_high_normalized",
+    "par_coupon_normalized", "spread_5yr_normalized", "spread_10yr_normalized", "spread_avg_normalized",
+    "qtd_ref_date", "qtd_chg_ust_5yr", "qtd_chg_ust_10yr",
+    "qtd_chg_spread_5yr_raw", "qtd_chg_spread_10yr_raw", "qtd_chg_spread_avg_raw",
+    "qtd_chg_spread_5yr_normalized", "qtd_chg_spread_10yr_normalized", "qtd_chg_spread_avg_normalized",
+    "ingested_at",
+]
 
 
 def upsert_day(record, db_path=DEFAULT_DB_PATH):
@@ -149,69 +208,20 @@ def upsert_day(record, db_path=DEFAULT_DB_PATH):
     if isinstance(finra_date, date):
         finra_date = finra_date.isoformat()
 
-    row = {
-        "finra_date": finra_date,
-        "settlement_month": record.get("settlement_month"),
-        "ust_5yr": record.get("ust_5yr"),
-        "ust_10yr": record.get("ust_10yr"),
-        "ust_source": record.get("ust_source"),
-        "ust_stale": int(bool(record.get("ust_stale", False))),
-        "coupon_low": record.get("coupon_low"),
-        "price_low": record.get("price_low"),
-        "coupon_high": record.get("coupon_high"),
-        "price_high": record.get("price_high"),
-        "par_coupon": record.get("par_coupon"),
-        "spread_5yr": record.get("spread_5yr"),
-        "spread_10yr": record.get("spread_10yr"),
-        "spread_avg": record.get("spread_avg"),
-        "qtd_ref_date": record.get("qtd_ref_date"),
-        "qtd_chg_ust_5yr": record.get("qtd_chg_ust_5yr"),
-        "qtd_chg_ust_10yr": record.get("qtd_chg_ust_10yr"),
-        "qtd_chg_spread_5yr": record.get("qtd_chg_spread_5yr"),
-        "qtd_chg_spread_10yr": record.get("qtd_chg_spread_10yr"),
-        "qtd_chg_spread_avg": record.get("qtd_chg_spread_avg"),
-        "ingested_at": datetime.now(timezone.utc).isoformat(),
-    }
+    row = {col: record.get(col) for col in _COLUMNS}
+    row["finra_date"] = finra_date
+    row["ust_stale"] = int(bool(record.get("ust_stale", False)))
+    row["ingested_at"] = datetime.now(timezone.utc).isoformat()
+
+    placeholders = ", ".join(f":{c}" for c in _COLUMNS)
+    update_clause = ", ".join(f"{c}=excluded.{c}" for c in _COLUMNS if c != "finra_date")
 
     with _connect(db_path) as conn:
         conn.execute(
-            """
-            INSERT INTO daily_spreads (
-                finra_date, settlement_month, ust_5yr, ust_10yr, ust_source, ust_stale,
-                coupon_low, price_low, coupon_high, price_high, par_coupon,
-                spread_5yr, spread_10yr, spread_avg,
-                qtd_ref_date, qtd_chg_ust_5yr, qtd_chg_ust_10yr,
-                qtd_chg_spread_5yr, qtd_chg_spread_10yr, qtd_chg_spread_avg,
-                ingested_at
-            ) VALUES (
-                :finra_date, :settlement_month, :ust_5yr, :ust_10yr, :ust_source, :ust_stale,
-                :coupon_low, :price_low, :coupon_high, :price_high, :par_coupon,
-                :spread_5yr, :spread_10yr, :spread_avg,
-                :qtd_ref_date, :qtd_chg_ust_5yr, :qtd_chg_ust_10yr,
-                :qtd_chg_spread_5yr, :qtd_chg_spread_10yr, :qtd_chg_spread_avg,
-                :ingested_at
-            )
-            ON CONFLICT(finra_date) DO UPDATE SET
-                settlement_month=excluded.settlement_month,
-                ust_5yr=excluded.ust_5yr,
-                ust_10yr=excluded.ust_10yr,
-                ust_source=excluded.ust_source,
-                ust_stale=excluded.ust_stale,
-                coupon_low=excluded.coupon_low,
-                price_low=excluded.price_low,
-                coupon_high=excluded.coupon_high,
-                price_high=excluded.price_high,
-                par_coupon=excluded.par_coupon,
-                spread_5yr=excluded.spread_5yr,
-                spread_10yr=excluded.spread_10yr,
-                spread_avg=excluded.spread_avg,
-                qtd_ref_date=excluded.qtd_ref_date,
-                qtd_chg_ust_5yr=excluded.qtd_chg_ust_5yr,
-                qtd_chg_ust_10yr=excluded.qtd_chg_ust_10yr,
-                qtd_chg_spread_5yr=excluded.qtd_chg_spread_5yr,
-                qtd_chg_spread_10yr=excluded.qtd_chg_spread_10yr,
-                qtd_chg_spread_avg=excluded.qtd_chg_spread_avg,
-                ingested_at=excluded.ingested_at
+            f"""
+            INSERT INTO daily_spreads ({", ".join(_COLUMNS)})
+            VALUES ({placeholders})
+            ON CONFLICT(finra_date) DO UPDATE SET {update_clause}
             """,
             row,
         )
@@ -251,18 +261,21 @@ if __name__ == "__main__":
         {
             "finra_date": date(2026, 7, 10),
             "settlement_month": "August",
+            "next_settlement_month": "September",
+            "days_to_near": 34,
+            "days_to_next": 65,
             "ust_5yr": 3.90,
             "ust_10yr": 4.20,
             "ust_source": "treasury.gov",
             "ust_stale": False,
-            "coupon_low": 5.0,
-            "price_low": 99.5,
-            "coupon_high": 5.5,
-            "price_high": 101.2,
-            "par_coupon": 5.125,
-            "spread_5yr": s5,
-            "spread_10yr": s10,
-            "spread_avg": savg,
+            "coupon_low_raw": 5.0,
+            "price_low_raw": 99.5,
+            "coupon_high_raw": 5.5,
+            "price_high_raw": 101.2,
+            "par_coupon_raw": 5.125,
+            "spread_5yr_raw": s5,
+            "spread_10yr_raw": s10,
+            "spread_avg_raw": savg,
         }
     )
     print(get_day(date(2026, 7, 10)))

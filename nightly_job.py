@@ -142,8 +142,8 @@ def fetch_finra_file_with_retry(
 
 
 def _row_is_complete(row):
-    """A row only counts as 'done' if it has both a par coupon and a fresh (non-stale) treasury rate."""
-    return row is not None and not row["ust_stale"] and row["par_coupon"] is not None
+    """A row only counts as 'done' if it has both a raw par coupon and a fresh (non-stale) treasury rate."""
+    return row is not None and not row["ust_stale"] and row["par_coupon_raw"] is not None
 
 
 def run_nightly_job(
@@ -164,8 +164,8 @@ def run_nightly_job(
         existing = db.get_day(expected_date, db_path=db_path)
         if _row_is_complete(existing):
             logger.info(
-                "Row for %s already complete (par_coupon=%s, stale=%s) - skipping. Pass --force to reprocess.",
-                expected_date, existing["par_coupon"], existing["ust_stale"],
+                "Row for %s already complete (par_coupon_raw=%s, stale=%s) - skipping. Pass --force to reprocess.",
+                expected_date, existing["par_coupon_raw"], existing["ust_stale"],
             )
             return existing
 
@@ -186,19 +186,26 @@ def run_nightly_job(
             "ust_5yr/ust_10yr/spreads written as NULL - re-run this job later to fill them in.",
             data_as_of,
         )
-    if record["par_coupon"] is None:
+    if record["par_coupon_raw"] is None:
         logger.warning(
-            "Par coupon not computable for %s (settlement_month=%s): no valid interpolation bracket.",
+            "Raw par coupon not computable for %s (settlement_month=%s): no valid interpolation bracket.",
             data_as_of, record["settlement_month"],
+        )
+    if record["par_coupon_normalized"] is None:
+        logger.warning(
+            "Normalized par coupon not computable for %s (near=%s, next=%s): "
+            "missing next-month data or no shared coupon bucket.",
+            data_as_of, record["settlement_month"], record["next_settlement_month"],
         )
 
     db.upsert_day(record, db_path=db_path)
 
     logger.info(
-        "Wrote %s: settlement=%s par_coupon=%s ust_5yr=%s ust_10yr=%s spread_avg=%s stale=%s qtd_ref=%s qtd_chg_spread_avg=%s",
-        data_as_of, record["settlement_month"], record["par_coupon"],
-        record["ust_5yr"], record["ust_10yr"], record["spread_avg"], record["ust_stale"],
-        record["qtd_ref_date"], record["qtd_chg_spread_avg"],
+        "Wrote %s: settlement=%s par_coupon_raw=%s par_coupon_normalized=%s ust_5yr=%s ust_10yr=%s "
+        "spread_avg_raw=%s spread_avg_normalized=%s stale=%s qtd_ref=%s qtd_chg_spread_avg_raw=%s",
+        data_as_of, record["settlement_month"], record["par_coupon_raw"], record["par_coupon_normalized"],
+        record["ust_5yr"], record["ust_10yr"], record["spread_avg_raw"], record["spread_avg_normalized"],
+        record["ust_stale"], record["qtd_ref_date"], record["qtd_chg_spread_avg_raw"],
     )
     return record
 
