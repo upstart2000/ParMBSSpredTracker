@@ -48,8 +48,8 @@ SERIES_OPTIONS = {
 }
 
 
-SPREAD_COLUMNS = ["Spread vs 5yr (bps)", "Spread vs 10yr (bps)", "Spread vs Avg (bps)"]
-COMPUTED_ROW_LABELS = {"Delta", "Prior Quarter Change", "QTD Change"}
+SPREAD_COLUMNS = ["Spread vs 5yr (bps)", "Spread vs 10yr (bps)", "Spread vs 5/10yr (bps)"]
+COMPUTED_ROW_LABELS = {"Daily Change", "Prior Quarter Change", "QTD Change"}
 
 
 def _row_date(row):
@@ -73,15 +73,15 @@ def snapshot_row_values(row, suffix, coupon_union):
         return None
     curve = db.parse_coupon_curve(row.get(f"coupon_curve_{suffix}"))
     values = {
-        "UST 5yr (%)": row.get("ust_5yr"),
-        "UST 10yr (%)": row.get("ust_10yr"),
+        "UST 5yr": row.get("ust_5yr"),
+        "UST 10yr": row.get("ust_10yr"),
     }
     for c in coupon_union:
         values[f"UMBS {c:.1f}"] = curve.get(c)
-    values["Par Coupon (%)"] = row.get(f"par_coupon_{suffix}")
+    values["Par Coupon"] = row.get(f"par_coupon_{suffix}")
     values["Spread vs 5yr (bps)"] = row.get(f"spread_5yr_{suffix}")
     values["Spread vs 10yr (bps)"] = row.get(f"spread_10yr_{suffix}")
-    values["Spread vs Avg (bps)"] = row.get(f"spread_avg_{suffix}")
+    values["Spread vs 5/10yr (bps)"] = row.get(f"spread_avg_{suffix}")
     return values
 
 
@@ -101,9 +101,9 @@ def build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix):
     """
     Rows, in order: prior quarter-end, current quarter-end, Prior Quarter
     Change (current QE - prior QE), the two most recent stored trading days
-    (labeled with their actual dates), Delta (latest - prior), QTD Change
-    (latest - current QE). Any row whose source data isn't available yet
-    (e.g. no quarter-end baseline this early in the dataset) is omitted
+    (labeled with their actual dates), Daily Change (latest - prior), QTD
+    Change (latest - current QE). Any row whose source data isn't available
+    yet (e.g. no quarter-end baseline this early in the dataset) is omitted
     rather than shown empty.
     """
     coupon_union = sorted(
@@ -113,13 +113,10 @@ def build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix):
         | bracket_coupons(prior_qe, suffix)
     )
     columns = (
-        ["UST 5yr (%)", "UST 10yr (%)"]
+        ["UST 5yr", "UST 10yr"]
         + [f"UMBS {c:.1f}" for c in coupon_union]
-        + ["Par Coupon (%)"] + SPREAD_COLUMNS
+        + ["Par Coupon"] + SPREAD_COLUMNS
     )
-    # Prior Quarter Change / QTD Change cover UST yields, UMBS prices, and spreads -
-    # everything except Par Coupon (a rate, not a price/yield level worth diffing here).
-    change_row_scope = [c for c in columns if c != "Par Coupon (%)"]
 
     today_vals = snapshot_row_values(today_row, suffix, coupon_union)
     prior_vals = snapshot_row_values(prior_row, suffix, coupon_union)
@@ -132,16 +129,14 @@ def build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix):
     if current_qe_vals is not None:
         rows[f"{_quarter_label(_row_date(current_qe))} End ({_row_date(current_qe)})"] = current_qe_vals
     if current_qe_vals is not None and prior_qe_vals is not None:
-        rows["Prior Quarter Change"] = diff_row(
-            current_qe_vals, prior_qe_vals, columns, scope_columns=change_row_scope
-        )
+        rows["Prior Quarter Change"] = diff_row(current_qe_vals, prior_qe_vals, columns)
     if prior_vals is not None:
         rows[_row_date(prior_row).isoformat()] = prior_vals
     rows[_row_date(today_row).isoformat()] = today_vals
     if prior_vals is not None:
-        rows["Delta"] = diff_row(today_vals, prior_vals, columns)
+        rows["Daily Change"] = diff_row(today_vals, prior_vals, columns)
     if current_qe_vals is not None:
-        rows["QTD Change"] = diff_row(today_vals, current_qe_vals, columns, scope_columns=change_row_scope)
+        rows["QTD Change"] = diff_row(today_vals, current_qe_vals, columns)
 
     return pd.DataFrame.from_dict(rows, orient="index", columns=columns)
 
@@ -227,7 +222,7 @@ else:
     with cols[3]:
         qtd_metric("Spread vs 10yr", today_row.get(f"spread_10yr_{suffix}"), " bps", today_row.get(f"qtd_chg_spread_10yr_{suffix}"))
     with cols[4]:
-        qtd_metric("Spread vs Avg", today_row.get(f"spread_avg_{suffix}"), " bps", today_row.get(f"qtd_chg_spread_avg_{suffix}"))
+        qtd_metric("Spread vs 5/10yr", today_row.get(f"spread_avg_{suffix}"), " bps", today_row.get(f"qtd_chg_spread_avg_{suffix}"))
 
 st.divider()
 
@@ -235,22 +230,6 @@ st.divider()
 current_qe, prior_qe = db.get_quarter_end_rows(today_row["finra_date"].date())
 daily_table = build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix)
 st.dataframe(style_daily_table(daily_table), width="stretch")
-st.caption(
-    "Delta = latest stored day − prior stored day, across every column. "
-    "Prior Quarter Change / QTD Change apply to UST yields, UMBS prices, and spreads "
-    "(shown as “—” only for Par Coupon)."
-)
-
-incomplete_dates = [
-    _row_date(row).isoformat()
-    for row in (today_row, prior_row, current_qe, prior_qe)
-    if row is not None and row.get(f"par_coupon_{suffix}") is None
-]
-if incomplete_dates:
-    st.caption(
-        f"⚠️ {series_choice} par coupon wasn't computable for: {', '.join(incomplete_dates)} "
-        "(missing/thin next-month data that day for interpolation). Shown as “—” above rather than guessed at."
-    )
 
 st.divider()
 
@@ -274,7 +253,7 @@ fig = go.Figure()
 series = [
     (f"spread_5yr_{suffix}", "Spread vs 5yr", COLOR_SPREAD_5YR),
     (f"spread_10yr_{suffix}", "Spread vs 10yr", COLOR_SPREAD_10YR),
-    (f"spread_avg_{suffix}", "Spread vs Avg(5,10)", COLOR_SPREAD_AVG),
+    (f"spread_avg_{suffix}", "Spread vs 5/10yr", COLOR_SPREAD_AVG),
 ]
 for col, name, color in series:
     fig.add_trace(
