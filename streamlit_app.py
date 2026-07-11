@@ -49,7 +49,6 @@ SERIES_OPTIONS = {
 
 
 SPREAD_COLUMNS = ["Spread vs 5yr (bps)", "Spread vs 10yr (bps)", "Spread vs Avg (bps)"]
-YIELD_AND_SPREAD_COLUMNS = ["UST 5yr (%)", "UST 10yr (%)"] + SPREAD_COLUMNS
 COMPUTED_ROW_LABELS = {"Delta", "Prior Quarter Change", "QTD Change"}
 
 
@@ -118,6 +117,9 @@ def build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix):
         + [f"UMBS {c:.1f}" for c in coupon_union]
         + ["Par Coupon (%)"] + SPREAD_COLUMNS
     )
+    # Prior Quarter Change / QTD Change cover UST yields, UMBS prices, and spreads -
+    # everything except Par Coupon (a rate, not a price/yield level worth diffing here).
+    change_row_scope = [c for c in columns if c != "Par Coupon (%)"]
 
     today_vals = snapshot_row_values(today_row, suffix, coupon_union)
     prior_vals = snapshot_row_values(prior_row, suffix, coupon_union)
@@ -131,7 +133,7 @@ def build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix):
         rows[f"{_quarter_label(_row_date(current_qe))} End ({_row_date(current_qe)})"] = current_qe_vals
     if current_qe_vals is not None and prior_qe_vals is not None:
         rows["Prior Quarter Change"] = diff_row(
-            current_qe_vals, prior_qe_vals, columns, scope_columns=YIELD_AND_SPREAD_COLUMNS
+            current_qe_vals, prior_qe_vals, columns, scope_columns=change_row_scope
         )
     if prior_vals is not None:
         rows[_row_date(prior_row).isoformat()] = prior_vals
@@ -139,7 +141,7 @@ def build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix):
     if prior_vals is not None:
         rows["Delta"] = diff_row(today_vals, prior_vals, columns)
     if current_qe_vals is not None:
-        rows["QTD Change"] = diff_row(today_vals, current_qe_vals, columns, scope_columns=YIELD_AND_SPREAD_COLUMNS)
+        rows["QTD Change"] = diff_row(today_vals, current_qe_vals, columns, scope_columns=change_row_scope)
 
     return pd.DataFrame.from_dict(rows, orient="index", columns=columns)
 
@@ -212,13 +214,9 @@ series_choice = st.session_state.get("series_choice_widget", DEFAULT_SERIES_CHOI
 suffix = SERIES_OPTIONS[series_choice]
 
 # --- QTD change section (prominent, up top) ---
-st.subheader("Quarter-to-Date Change")
-
 if today_row.get("qtd_ref_date") is None:
     st.info("No prior-quarter baseline available yet for this dataset - QTD change can't be computed for the current quarter's first stretch of data.")
 else:
-    ref_date = pd.to_datetime(today_row["qtd_ref_date"]).date()
-    st.caption(f"vs. quarter-start reference: **{ref_date}**")
     cols = st.columns(5)
     with cols[0]:
         qtd_metric("5yr UST", today_row.get("ust_5yr"), "%", today_row.get("qtd_chg_ust_5yr"))
@@ -234,14 +232,13 @@ else:
 st.divider()
 
 # --- Daily table ---
-st.subheader("Daily Snapshot")
 current_qe, prior_qe = db.get_quarter_end_rows(today_row["finra_date"].date())
 daily_table = build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix)
 st.dataframe(style_daily_table(daily_table), width="stretch")
 st.caption(
     "Delta = latest stored day − prior stored day, across every column. "
-    "Prior Quarter Change / QTD Change apply to UST yields and spreads only "
-    "(shown as “—” for UMBS/par coupon columns)."
+    "Prior Quarter Change / QTD Change apply to UST yields, UMBS prices, and spreads "
+    "(shown as “—” only for Par Coupon)."
 )
 
 incomplete_dates = [
