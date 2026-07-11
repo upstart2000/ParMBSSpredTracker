@@ -244,6 +244,17 @@ st.caption(
     "(shown as “—” for UMBS/par coupon columns)."
 )
 
+incomplete_dates = [
+    _row_date(row).isoformat()
+    for row in (today_row, prior_row, current_qe, prior_qe)
+    if row is not None and row.get(f"par_coupon_{suffix}") is None
+]
+if incomplete_dates:
+    st.caption(
+        f"⚠️ {series_choice} par coupon wasn't computable for: {', '.join(incomplete_dates)} "
+        "(missing/thin next-month data that day for interpolation). Shown as “—” above rather than guessed at."
+    )
+
 st.divider()
 
 # --- Historical chart ---
@@ -293,6 +304,15 @@ fig.update_xaxes(showgrid=True, gridcolor=GRIDLINE, zeroline=False)
 fig.update_yaxes(showgrid=True, gridcolor=GRIDLINE, zeroline=True, zerolinecolor=GRIDLINE)
 
 st.plotly_chart(fig, width="stretch")
+
+if suffix == "normalized":
+    missing_count = int(df[f"par_coupon_{suffix}"].isna().sum())
+    if missing_count:
+        st.caption(
+            f"Normalized par coupon isn't computable for {missing_count} historical day(s) "
+            "(missing/thin next-month data that day) - those show as gaps in the lines above, "
+            "not zeros or an error."
+        )
 
 with st.expander("Show underlying data"):
     curve_cols = ["coupon_curve_raw", "coupon_curve_normalized"]
