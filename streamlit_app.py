@@ -124,6 +124,16 @@ st.caption(
     + (f"(prior: {prior_row['finra_date'].date()})" if prior_row else "(no prior day in dataset yet)")
 )
 
+if prior_row is not None:
+    gap_days = (today_row["finra_date"].date() - prior_row["finra_date"].date()).days
+    if gap_days > db.MAX_EXPECTED_GAP_DAYS:
+        st.warning(
+            f"⚠️ Data gap: {gap_days} calendar days between {prior_row['finra_date'].date()} and "
+            f"{today_row['finra_date'].date()} - wider than a normal weekend/holiday, so one or more "
+            "trading days are missing from the dataset. The 'Delta' row below and the QTD changes "
+            "reflect the full gap, not a single day's move."
+        )
+
 series_choice = st.radio(
     "Par coupon / spread series",
     options=list(SERIES_OPTIONS.keys()),

@@ -246,6 +246,32 @@ def get_latest(n=2, db_path=DEFAULT_DB_PATH):
         return list(reversed(rows))
 
 
+MAX_EXPECTED_GAP_DAYS = 4  # a normal weekend is 3; a Monday/Friday holiday + weekend is 4
+
+
+def find_date_gaps(db_path=DEFAULT_DB_PATH, max_expected_gap_days=MAX_EXPECTED_GAP_DAYS):
+    """
+    Scans all stored dates in order and returns a list of
+    (date_before, date_after, calendar_gap_days) for every consecutive pair
+    whose gap exceeds max_expected_gap_days - i.e. wider than an ordinary
+    weekend or a single holiday long-weekend, and therefore likely missing
+    trading day(s) rather than an expected non-trading stretch. We don't have
+    a full market holiday calendar wired in (only SIFMA settlement dates), so
+    this is a heuristic threshold, not exact - but a 4-day cap catches
+    anything wider than one holiday weekend.
+    """
+    with _connect(db_path) as conn:
+        cur = conn.execute("SELECT finra_date FROM daily_spreads ORDER BY finra_date ASC")
+        dates = [date.fromisoformat(r["finra_date"]) for r in cur.fetchall()]
+
+    gaps = []
+    for prev_date, next_date in zip(dates, dates[1:]):
+        gap_days = (next_date - prev_date).days
+        if gap_days > max_expected_gap_days:
+            gaps.append((prev_date, next_date, gap_days))
+    return gaps
+
+
 def get_all(db_path=DEFAULT_DB_PATH):
     """All rows ordered ascending by date - primarily for the historical chart."""
     with _connect(db_path) as conn:

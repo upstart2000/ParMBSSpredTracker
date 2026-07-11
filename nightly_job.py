@@ -34,7 +34,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -160,6 +160,18 @@ def run_nightly_job(
     logger.info("Nightly job starting, expected trade date %s", expected_date)
 
     db.init_db(db_path)
+
+    latest = db.get_latest(1, db_path=db_path)
+    if latest and latest[0]["finra_date"] != expected_date.isoformat():
+        gap_days = (expected_date - date.fromisoformat(latest[0]["finra_date"])).days
+        if gap_days > db.MAX_EXPECTED_GAP_DAYS:
+            logger.warning(
+                "Data gap: most recent row before this run is %s, %d calendar days before "
+                "expected trade date %s - wider than a normal weekend/holiday. Likely missing "
+                "trading day(s); may need a backfill once the source data is available.",
+                latest[0]["finra_date"], gap_days, expected_date,
+            )
+
     if not force:
         existing = db.get_day(expected_date, db_path=db_path)
         if _row_is_complete(existing):
