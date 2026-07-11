@@ -171,8 +171,9 @@ def style_daily_table(table_df):
 
 
 def qtd_metric(label, value, unit, qtd_chg):
-    value_str = f"{value:.2f}{unit}" if value is not None else "—"
-    delta_str = f"{qtd_chg:+.1f} bps QTD" if qtd_chg is not None else None
+    precision = 0 if unit.strip() == "bps" else 2
+    value_str = f"{value:.{precision}f}{unit}" if value is not None else "—"
+    delta_str = f"{qtd_chg:+.0f} bps QTD" if qtd_chg is not None else None
     st.metric(label=label, value=value_str, delta=delta_str)
 
 
@@ -188,32 +189,26 @@ latest_rows = df.tail(2).to_dict("records")
 today_row = latest_rows[-1]
 prior_row = latest_rows[-2] if len(latest_rows) > 1 else None
 
-st.caption(
-    f"Most recent trading day: **{today_row['finra_date'].date()}** "
-    + (f"(prior: {prior_row['finra_date'].date()})" if prior_row else "(no prior day in dataset yet)")
-)
-
+# Gap-detection logic stays fully intact and still runs here - only its display
+# moved (to the bottom of the page, see the end of this script).
+gap_warning = None
 if prior_row is not None:
     gap_days = (today_row["finra_date"].date() - prior_row["finra_date"].date()).days
     if gap_days > db.MAX_EXPECTED_GAP_DAYS:
-        st.warning(
+        gap_warning = (
             f"⚠️ Data gap: {gap_days} calendar days between {prior_row['finra_date'].date()} and "
             f"{today_row['finra_date'].date()} - wider than a normal weekend/holiday, so one or more "
             "trading days are missing from the dataset. The 'Delta' row below and the QTD changes "
             "reflect the full gap, not a single day's move."
         )
 
-series_choice = st.radio(
-    "Par coupon / spread series",
-    options=list(SERIES_OPTIONS.keys()),
-    horizontal=True,
-    help=(
-        "Raw uses whichever settlement month is nearest today - the implied price drifts as "
-        "days-to-settlement shrink toward the next roll, then jumps at the roll (a sawtooth "
-        "artifact on top of real spread movement). Normalized interpolates near/next month "
-        "prices to a fixed 30-day-to-settlement horizon, removing that artifact."
-    ),
-)
+# The Raw/Normalized selector widget itself renders further down (near the
+# historical chart), but its value is needed up here for the QTD section and
+# Daily Snapshot table. Streamlit persists widget state in session_state
+# across reruns, so reading it via the widget's key before the widget is
+# instantiated later in this same run still reflects the current selection.
+DEFAULT_SERIES_CHOICE = next(iter(SERIES_OPTIONS))
+series_choice = st.session_state.get("series_choice_widget", DEFAULT_SERIES_CHOICE)
 suffix = SERIES_OPTIONS[series_choice]
 
 # --- QTD change section (prominent, up top) ---
@@ -252,7 +247,20 @@ st.caption(
 st.divider()
 
 # --- Historical chart ---
-st.subheader(f"Historical Spread — {series_choice}")
+st.subheader("Historical Spread")
+
+st.radio(
+    "Par coupon / spread series",
+    options=list(SERIES_OPTIONS.keys()),
+    horizontal=True,
+    key="series_choice_widget",
+    help=(
+        "Raw uses whichever settlement month is nearest today - the implied price drifts as "
+        "days-to-settlement shrink toward the next roll, then jumps at the roll (a sawtooth "
+        "artifact on top of real spread movement). Normalized interpolates near/next month "
+        "prices to a fixed 30-day-to-settlement horizon, removing that artifact."
+    ),
+)
 
 fig = go.Figure()
 series = [
@@ -289,3 +297,7 @@ st.plotly_chart(fig, width="stretch")
 with st.expander("Show underlying data"):
     curve_cols = ["coupon_curve_raw", "coupon_curve_normalized"]
     st.dataframe(df.drop(columns=curve_cols), width="stretch")
+
+st.divider()
+if gap_warning:
+    st.warning(gap_warning)
