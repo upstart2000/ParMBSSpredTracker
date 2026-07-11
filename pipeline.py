@@ -21,10 +21,19 @@ Computes two parallel par-coupon/spread series per day:
 Both series are computed and stored side by side - the normalized series
 does not replace the raw one.
 """
+import json
+
 from finra_parser import parse_tba_30y_umbs, compute_par_coupon, get_data_as_of_date
 from settlement_calendar import CLASS_A_SETTLEMENT_DATES_2026, get_near_month_settlement, get_next_settlement_month
 from treasury_rates import get_treasury_rates
 from db import compute_spreads
+
+
+def _serialize_curve(curve):
+    """{coupon: price} -> JSON object with string keys (JSON has no float keys). None if empty/missing."""
+    if not curve:
+        return None
+    return json.dumps({str(c): p for c, p in curve.items()})
 
 TARGET_DAYS_TO_SETTLEMENT = 30  # constant-maturity horizon; adjust here if needed
 
@@ -74,6 +83,7 @@ def build_normalized_leg(parsed, near_month, finra_date, settlement_dates=None, 
         "coupon_high_normalized": None,
         "price_high_normalized": None,
         "par_coupon_normalized": None,
+        "coupon_curve_normalized": {},
     }
 
     if near_month is None or near_month not in settlement_dates:
@@ -92,6 +102,7 @@ def build_normalized_leg(parsed, near_month, finra_date, settlement_dates=None, 
     normalized_prices = _time_interpolate_prices(
         parsed[near_month], parsed[next_month], days_to_near, days_to_next, target_days
     )
+    result["coupon_curve_normalized"] = normalized_prices
     if not normalized_prices:
         return result
 
@@ -160,7 +171,11 @@ def build_daily_record(filepath, finra_date=None, allow_yahoo_fallback=True, set
                 price_high_raw=p_high,
             )
 
-    record.update(build_normalized_leg(parsed, near_month, finra_date, settlement_dates=settlement_dates))
+    record["coupon_curve_raw"] = _serialize_curve(coupon_prices)
+
+    normalized_leg = build_normalized_leg(parsed, near_month, finra_date, settlement_dates=settlement_dates)
+    normalized_leg["coupon_curve_normalized"] = _serialize_curve(normalized_leg["coupon_curve_normalized"])
+    record.update(normalized_leg)
 
     treasury = get_treasury_rates(finra_date, allow_yahoo_fallback=allow_yahoo_fallback)
     record["ust_5yr"] = treasury.get("ust_5yr")

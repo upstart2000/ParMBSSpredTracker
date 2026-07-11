@@ -27,6 +27,7 @@ QTD is tracked for both the raw and normalized spread series. A row in the
 first quarter a dataset covers has no prior-quarter baseline available, so
 its QTD fields are NULL - not a bug, just no reference point.
 """
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
@@ -63,6 +64,9 @@ CREATE TABLE IF NOT EXISTS daily_spreads (
     spread_10yr_normalized     REAL,    -- bps
     spread_avg_normalized      REAL,    -- bps
 
+    coupon_curve_raw        TEXT,       -- JSON {coupon: price}, full reliably-extractable near-month curve
+    coupon_curve_normalized TEXT,       -- JSON {coupon: price}, full time-interpolated normalized curve
+
     qtd_ref_date    TEXT,               -- date of the prior-quarter reference row used below (NULL if none)
     qtd_chg_ust_5yr                 REAL,  -- bps, vs qtd_ref_date
     qtd_chg_ust_10yr                REAL,  -- bps, vs qtd_ref_date
@@ -92,6 +96,17 @@ def _connect(db_path):
 def init_db(db_path=DEFAULT_DB_PATH):
     with _connect(db_path) as conn:
         conn.execute(SCHEMA)
+
+
+def parse_coupon_curve(curve_json):
+    """
+    Deserializes a coupon_curve_raw/coupon_curve_normalized cell (JSON object
+    with string coupon keys, as written by pipeline.py) back into a
+    {float coupon: float price} dict. Returns {} for None/empty input.
+    """
+    if not curve_json:
+        return {}
+    return {float(c): p for c, p in json.loads(curve_json).items()}
 
 
 def compute_spreads(par_coupon, ust_5yr, ust_10yr):
@@ -131,6 +146,29 @@ def get_qtd_reference_row(finra_date, db_path=DEFAULT_DB_PATH):
         )
         row = cur.fetchone()
         return dict(row) if row else None
+
+
+def get_quarter_end_rows(latest_date, db_path=DEFAULT_DB_PATH):
+    """
+    Resolves the current and prior quarter-end snapshot rows relative to
+    latest_date, purely from what's actually in the db (not a hardcoded
+    calendar date, so this rolls forward automatically each quarter):
+
+    - current_quarter_end: the last stored row before latest_date's quarter
+      started - i.e. the most recently completed quarter's close (same
+      row get_qtd_reference_row(latest_date) would return).
+    - prior_quarter_end: the last stored row before *that* row's quarter
+      started - one quarter further back.
+
+    Either (or both) may be None if the dataset doesn't go back far enough.
+    """
+    current_quarter_end = get_qtd_reference_row(latest_date, db_path=db_path)
+    prior_quarter_end = (
+        get_qtd_reference_row(current_quarter_end["finra_date"], db_path=db_path)
+        if current_quarter_end is not None
+        else None
+    )
+    return current_quarter_end, prior_quarter_end
 
 
 def compute_qtd_fields(record, db_path=DEFAULT_DB_PATH):
@@ -190,6 +228,7 @@ _COLUMNS = [
     "spread_5yr_raw", "spread_10yr_raw", "spread_avg_raw",
     "coupon_low_normalized", "price_low_normalized", "coupon_high_normalized", "price_high_normalized",
     "par_coupon_normalized", "spread_5yr_normalized", "spread_10yr_normalized", "spread_avg_normalized",
+    "coupon_curve_raw", "coupon_curve_normalized",
     "qtd_ref_date", "qtd_chg_ust_5yr", "qtd_chg_ust_10yr",
     "qtd_chg_spread_5yr_raw", "qtd_chg_spread_10yr_raw", "qtd_chg_spread_avg_raw",
     "qtd_chg_spread_5yr_normalized", "qtd_chg_spread_10yr_normalized", "qtd_chg_spread_avg_normalized",

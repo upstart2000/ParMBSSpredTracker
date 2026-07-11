@@ -64,8 +64,9 @@ def expected_trade_date(now=None):
     The trading day whose data we expect FINRA to release this evening.
     Assumes the job runs the same evening as the trading day (~9PM ET, with a
     9:45PM ET retry - see .github/workflows/nightly.yml), and rolls a weekend
-    date back to the prior weekday. Does NOT account for market holidays
-    (SIFMA early-close / no-settlement days) - pass --date to override on those.
+    date back to the prior weekday. Does NOT account for market holidays -
+    see is_sifma_holiday(), checked separately in run_nightly_job() so a
+    holiday is treated as an expected no-data day, not an error.
     """
     if now is None:
         now = datetime.now(EASTERN)
@@ -73,6 +74,20 @@ def expected_trade_date(now=None):
     while d.weekday() >= 5:  # Saturday=5, Sunday=6
         d -= timedelta(days=1)
     return d
+
+
+def is_sifma_holiday(d):
+    """
+    True if d is not a SIFMA US bond market trading day (holiday or weekend).
+    Uses the SIFMA calendar specifically, not the NYSE equity calendar - they
+    differ on days like Columbus Day and Veterans Day (bond market closed,
+    equity market open).
+    """
+    import pandas_market_calendars as mcal
+
+    cal = mcal.get_calendar("SIFMA_US")
+    schedule = cal.schedule(start_date=d, end_date=d)
+    return schedule.empty
 
 
 def fetch_finra_file_with_retry(
@@ -158,6 +173,13 @@ def run_nightly_job(
 ):
     expected_date = expected_date or expected_trade_date()
     logger.info("Nightly job starting, expected trade date %s", expected_date)
+
+    if is_sifma_holiday(expected_date):
+        logger.info(
+            "%s is a SIFMA bond market holiday - no data expected, exiting cleanly (no fetch, no retry).",
+            expected_date,
+        )
+        return {"finra_date": expected_date, "sifma_holiday": True}
 
     db.init_db(db_path)
 

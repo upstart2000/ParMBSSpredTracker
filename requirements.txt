@@ -6,3 +6,4 @@ plotly==6.9.0
 pandas==3.0.3
 pyarrow==25.0.0
 numpy==2.5.1
+pandas_market_calendars==5.4.0

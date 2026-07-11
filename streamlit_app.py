@@ -7,6 +7,7 @@ path is relative to the repo root, which is the working directory both
 locally and on Cloud.
 """
 import os
+from datetime import date
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -47,44 +48,105 @@ SERIES_OPTIONS = {
 }
 
 
-def daily_table_columns(suffix):
-    return [
-        ("ust_5yr", "UST 5yr (%)"),
-        ("ust_10yr", "UST 10yr (%)"),
-        (f"coupon_low_{suffix}", "UMBS Low Coupon (%)"),
-        (f"price_low_{suffix}", "UMBS Low Price"),
-        (f"coupon_high_{suffix}", "UMBS High Coupon (%)"),
-        (f"price_high_{suffix}", "UMBS High Price"),
-        (f"par_coupon_{suffix}", "Par Coupon (%)"),
-        (f"spread_5yr_{suffix}", "Spread vs 5yr (bps)"),
-        (f"spread_10yr_{suffix}", "Spread vs 10yr (bps)"),
-        (f"spread_avg_{suffix}", "Spread vs Avg (bps)"),
-    ]
+SPREAD_COLUMNS = ["Spread vs 5yr (bps)", "Spread vs 10yr (bps)", "Spread vs Avg (bps)"]
+YIELD_AND_SPREAD_COLUMNS = ["UST 5yr (%)", "UST 10yr (%)"] + SPREAD_COLUMNS
+COMPUTED_ROW_LABELS = {"Delta", "Prior Quarter Change", "QTD Change"}
 
 
-def build_daily_table(prior_row, today_row, suffix):
-    columns = daily_table_columns(suffix)
+def _row_date(row):
+    """row['finra_date'] may be a pandas Timestamp (rows from the df) or an ISO string (rows straight from db.py)."""
+    d = row["finra_date"]
+    return d.date() if hasattr(d, "date") else date.fromisoformat(d)
 
-    def extract(row):
-        if row is None:
-            return {label: None for _, label in columns}
-        return {label: row.get(key) for key, label in columns}
 
-    prior_vals = extract(prior_row)
-    today_vals = extract(today_row)
-    delta_vals = {
-        label: (today_vals[label] - prior_vals[label])
-        if (today_vals[label] is not None and prior_vals[label] is not None)
-        else None
-        for label in today_vals
+def _quarter_label(d):
+    return f"Q{(d.month - 1) // 3 + 1} {d.year}"
+
+
+def bracket_coupons(row, suffix):
+    if row is None:
+        return set()
+    return {row.get(f"coupon_low_{suffix}"), row.get(f"coupon_high_{suffix}")} - {None}
+
+
+def snapshot_row_values(row, suffix, coupon_union):
+    if row is None:
+        return None
+    curve = db.parse_coupon_curve(row.get(f"coupon_curve_{suffix}"))
+    values = {
+        "UST 5yr (%)": row.get("ust_5yr"),
+        "UST 10yr (%)": row.get("ust_10yr"),
     }
+    for c in coupon_union:
+        values[f"UMBS {c:.1f}"] = curve.get(c)
+    values["Par Coupon (%)"] = row.get(f"par_coupon_{suffix}")
+    values["Spread vs 5yr (bps)"] = row.get(f"spread_5yr_{suffix}")
+    values["Spread vs 10yr (bps)"] = row.get(f"spread_10yr_{suffix}")
+    values["Spread vs Avg (bps)"] = row.get(f"spread_avg_{suffix}")
+    return values
 
-    return pd.DataFrame([prior_vals, today_vals, delta_vals], index=["Prior Day", "Today", "Delta"])
+
+def diff_row(values_a, values_b, columns, scope_columns=None):
+    """values_a - values_b, restricted to scope_columns if given (else every column)."""
+    result = {}
+    for col in columns:
+        if scope_columns is not None and col not in scope_columns:
+            result[col] = None
+            continue
+        a, b = values_a.get(col), values_b.get(col)
+        result[col] = (a - b) if (a is not None and b is not None) else None
+    return result
+
+
+def build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix):
+    """
+    Rows, in order: prior quarter-end, current quarter-end, Prior Quarter
+    Change (current QE - prior QE), the two most recent stored trading days
+    (labeled with their actual dates), Delta (latest - prior), QTD Change
+    (latest - current QE). Any row whose source data isn't available yet
+    (e.g. no quarter-end baseline this early in the dataset) is omitted
+    rather than shown empty.
+    """
+    coupon_union = sorted(
+        bracket_coupons(today_row, suffix)
+        | bracket_coupons(prior_row, suffix)
+        | bracket_coupons(current_qe, suffix)
+        | bracket_coupons(prior_qe, suffix)
+    )
+    columns = (
+        ["UST 5yr (%)", "UST 10yr (%)"]
+        + [f"UMBS {c:.1f}" for c in coupon_union]
+        + ["Par Coupon (%)"] + SPREAD_COLUMNS
+    )
+
+    today_vals = snapshot_row_values(today_row, suffix, coupon_union)
+    prior_vals = snapshot_row_values(prior_row, suffix, coupon_union)
+    current_qe_vals = snapshot_row_values(current_qe, suffix, coupon_union)
+    prior_qe_vals = snapshot_row_values(prior_qe, suffix, coupon_union)
+
+    rows = {}
+    if prior_qe_vals is not None:
+        rows[f"{_quarter_label(_row_date(prior_qe))} End ({_row_date(prior_qe)})"] = prior_qe_vals
+    if current_qe_vals is not None:
+        rows[f"{_quarter_label(_row_date(current_qe))} End ({_row_date(current_qe)})"] = current_qe_vals
+    if current_qe_vals is not None and prior_qe_vals is not None:
+        rows["Prior Quarter Change"] = diff_row(
+            current_qe_vals, prior_qe_vals, columns, scope_columns=YIELD_AND_SPREAD_COLUMNS
+        )
+    if prior_vals is not None:
+        rows[_row_date(prior_row).isoformat()] = prior_vals
+    rows[_row_date(today_row).isoformat()] = today_vals
+    if prior_vals is not None:
+        rows["Delta"] = diff_row(today_vals, prior_vals, columns)
+    if current_qe_vals is not None:
+        rows["QTD Change"] = diff_row(today_vals, current_qe_vals, columns, scope_columns=YIELD_AND_SPREAD_COLUMNS)
+
+    return pd.DataFrame.from_dict(rows, orient="index", columns=columns)
 
 
 def style_daily_table(table_df):
-    def highlight_delta_row(row):
-        if row.name != "Delta":
+    def highlight_computed_rows(row):
+        if row.name not in COMPUTED_ROW_LABELS:
             return ["" for _ in row]
         styles = []
         for v in row:
@@ -98,7 +160,14 @@ def style_daily_table(table_df):
                 styles.append("")
         return styles
 
-    return table_df.style.format(precision=2, na_rep="—").apply(highlight_delta_row, axis=1)
+    spread_cols = [c for c in table_df.columns if c in SPREAD_COLUMNS]
+    other_cols = [c for c in table_df.columns if c not in SPREAD_COLUMNS]
+    return (
+        table_df.style
+        .format(precision=2, na_rep="—", subset=other_cols)
+        .format(precision=0, na_rep="—", subset=spread_cols)
+        .apply(highlight_computed_rows, axis=1)
+    )
 
 
 def qtd_metric(label, value, unit, qtd_chg):
@@ -171,9 +240,14 @@ st.divider()
 
 # --- Daily table ---
 st.subheader("Daily Snapshot")
-daily_table = build_daily_table(prior_row, today_row, suffix)
+current_qe, prior_qe = db.get_quarter_end_rows(today_row["finra_date"].date())
+daily_table = build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix)
 st.dataframe(style_daily_table(daily_table), width="stretch")
-st.caption("Delta = Today − Prior Day. Note: if the near-month settlement rolled between the two days, the UMBS bracket coupons may differ, so their delta reflects the roll as well as any price move.")
+st.caption(
+    "Delta = latest stored day − prior stored day, across every column. "
+    "Prior Quarter Change / QTD Change apply to UST yields and spreads only "
+    "(shown as “—” for UMBS/par coupon columns)."
+)
 
 st.divider()
 
@@ -213,4 +287,5 @@ fig.update_yaxes(showgrid=True, gridcolor=GRIDLINE, zeroline=True, zerolinecolor
 st.plotly_chart(fig, width="stretch")
 
 with st.expander("Show underlying data"):
-    st.dataframe(df, width="stretch")
+    curve_cols = ["coupon_curve_raw", "coupon_curve_normalized"]
+    st.dataframe(df.drop(columns=curve_cols), width="stretch")
