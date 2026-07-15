@@ -59,6 +59,9 @@ DEFAULT_MAX_BACKOFF_SEC = 120
 logger = logging.getLogger("nightly_job")
 
 
+EARLY_MORNING_CUTOFF_HOUR = 6  # ET; see expected_trade_date()
+
+
 def expected_trade_date(now=None):
     """
     The trading day whose data we expect FINRA to release this evening.
@@ -67,10 +70,21 @@ def expected_trade_date(now=None):
     date back to the prior weekday. Does NOT account for market holidays -
     see is_sifma_holiday(), checked separately in run_nightly_job() so a
     holiday is treated as an expected no-data day, not an error.
+
+    GitHub Actions has been observed delaying these `schedule`-triggered runs
+    by several hours, occasionally pushing a 9PM/9:45PM ET firing past
+    midnight. The earliest a new cycle can legitimately fire is 9PM ET, so a
+    run landing between midnight and EARLY_MORNING_CUTOFF_HOUR is still a late
+    firing of *last* evening's cycle, not the start of tonight's - roll it
+    back a day so it recognizes last evening's row as already complete
+    instead of treating tomorrow's (not-yet-released) file as missing and
+    erroring out.
     """
     if now is None:
         now = datetime.now(EASTERN)
     d = now.date()
+    if now.hour < EARLY_MORNING_CUTOFF_HOUR:
+        d -= timedelta(days=1)
     while d.weekday() >= 5:  # Saturday=5, Sunday=6
         d -= timedelta(days=1)
     return d
