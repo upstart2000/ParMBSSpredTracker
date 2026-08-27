@@ -59,7 +59,7 @@ DEFAULT_MAX_BACKOFF_SEC = 120
 logger = logging.getLogger("nightly_job")
 
 
-EARLY_MORNING_CUTOFF_HOUR = 6  # ET; see expected_trade_date()
+EARLY_MORNING_CUTOFF_HOUR = 20  # ET; see expected_trade_date()
 
 
 def expected_trade_date(now=None):
@@ -72,11 +72,17 @@ def expected_trade_date(now=None):
     holiday is treated as an expected no-data day, not an error.
 
     GitHub Actions has been observed delaying these `schedule`-triggered runs
-    by several hours, occasionally pushing a 9PM/9:45PM ET firing past
-    midnight. The earliest a new cycle can legitimately fire is 9PM ET, so a
-    run landing between midnight and EARLY_MORNING_CUTOFF_HOUR is still a late
-    firing of *last* evening's cycle, not the start of tonight's - roll it
-    back a day so it recognizes last evening's row as already complete
+    by several hours - not just past midnight, but on 2026-08-27 all the way
+    to 6:42/8:00/8:19 AM ET, well past the old 6 AM cutoff, which made that
+    delayed run treat itself as the start of a new (that day's) cycle and
+    error out chasing a file that wouldn't exist until that evening (see the
+    2026-08-27 commit "Nightly data update: ... (manual catch-up for
+    2026-08-26)"). FINRA doesn't post the file until ~8PM ET, and the
+    earliest a new cycle can legitimately fire is 9PM ET, so any run landing
+    before EARLY_MORNING_CUTOFF_HOUR (8PM ET) that same calendar day cannot
+    possibly be a legitimate attempt at that day's file - it's still a very
+    late firing of *last* evening's cycle, not the start of tonight's. Roll
+    it back a day so it recognizes last evening's row as already complete
     instead of treating tomorrow's (not-yet-released) file as missing and
     erroring out.
     """
