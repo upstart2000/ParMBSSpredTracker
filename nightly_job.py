@@ -59,7 +59,7 @@ DEFAULT_MAX_BACKOFF_SEC = 120
 logger = logging.getLogger("nightly_job")
 
 
-EARLY_MORNING_CUTOFF_HOUR = 20  # ET; see expected_trade_date()
+EARLY_MORNING_CUTOFF_HOUR = 18  # ET; see expected_trade_date()
 
 
 def expected_trade_date(now=None):
@@ -77,14 +77,17 @@ def expected_trade_date(now=None):
     delayed run treat itself as the start of a new (that day's) cycle and
     error out chasing a file that wouldn't exist until that evening (see the
     2026-08-27 commit "Nightly data update: ... (manual catch-up for
-    2026-08-26)"). FINRA doesn't post the file until ~8PM ET, and the
+    2026-08-26)"). FINRA is believed to post the file around 8PM ET, and the
     earliest a new cycle can legitimately fire is 9PM ET, so any run landing
-    before EARLY_MORNING_CUTOFF_HOUR (8PM ET) that same calendar day cannot
-    possibly be a legitimate attempt at that day's file - it's still a very
-    late firing of *last* evening's cycle, not the start of tonight's. Roll
-    it back a day so it recognizes last evening's row as already complete
-    instead of treating tomorrow's (not-yet-released) file as missing and
-    erroring out.
+    before EARLY_MORNING_CUTOFF_HOUR (6PM ET) that same calendar day is still
+    a very late firing of *last* evening's cycle, not the start of tonight's
+    - roll it back a day so it recognizes last evening's row as already
+    complete instead of treating tomorrow's (not-yet-released) file as
+    missing and erroring out. Note this leaves a 6-8PM ET gap where a
+    same-day-labeled firing would still hit the file too early and error
+    (same failure mode as before, just a narrower window) - 6PM was chosen
+    over 8PM deliberately, trading that narrower exposure for less risk of
+    ever mislabeling a legitimately early same-day run as yesterday's.
     """
     if now is None:
         now = datetime.now(EASTERN)
