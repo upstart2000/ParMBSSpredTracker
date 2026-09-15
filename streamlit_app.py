@@ -43,8 +43,8 @@ def load_dataframe(db_path=db.DEFAULT_DB_PATH):
 
 
 SERIES_OPTIONS = {
-    "Raw (near-month settlement)": "raw",
     "Normalized (30-day constant-maturity)": "normalized",
+    "Raw (near-month settlement)": "raw",
 }
 
 
