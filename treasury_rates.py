@@ -3,7 +3,9 @@ Fetches 5yr / 10yr UST par yields for a given date.
 Primary source: Treasury.gov Daily Treasury Par Yield Curve Rates XML feed.
 Fallback: Yahoo Finance (^FVX, ^TNX) if Treasury.gov hasn't posted same-day data yet.
 """
+import logging
 import re
+import time
 import requests
 from datetime import date, datetime
 from functools import lru_cache
@@ -12,6 +14,15 @@ TREASURY_XML_URL = (
     "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
     "pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value_month={yyyymm}"
 )
+
+# Small/quick by design, matching fetch_finra_file_with_retry in nightly_job.py:
+# this only needs to absorb a transient network blip within one run, not wait
+# out a real outage - a stale/unreachable row falls through to the Yahoo
+# fallback (or gets marked ust_stale) and a later scheduled run retries it.
+DEFAULT_MAX_ATTEMPTS = 2
+DEFAULT_RETRY_BACKOFF_SEC = 5
+
+logger = logging.getLogger("treasury_rates")
 
 
 @lru_cache(maxsize=None)
@@ -28,14 +39,31 @@ def _fetch_month_xml(yyyymm):
     return resp.text
 
 
-def fetch_treasury_gov(target_date):
+def fetch_treasury_gov(target_date, max_attempts=DEFAULT_MAX_ATTEMPTS, retry_backoff_sec=DEFAULT_RETRY_BACKOFF_SEC):
     """
     Pulls the current month's Treasury.gov XML feed and returns the row matching target_date.
     Returns dict {'date': date, 'ust_5yr': float, 'ust_10yr': float, 'source': 'treasury.gov'}
-    or None if that date isn't present yet (not posted / weekend / holiday).
+    or None if that date isn't present yet (not posted / weekend / holiday) OR if the feed
+    couldn't be fetched after retries (timeout, connection error, 5xx) - treated the same as
+    "not posted yet" so callers fall back to Yahoo / mark the row stale instead of crashing.
     """
     yyyymm = target_date.strftime("%Y%m")
-    xml_text = _fetch_month_xml(yyyymm)
+
+    xml_text = None
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            xml_text = _fetch_month_xml(yyyymm)
+            break
+        except requests.RequestException as e:
+            last_error = e
+            logger.warning("treasury.gov fetch attempt %d/%d failed: %s", attempt, max_attempts, e)
+            if attempt < max_attempts:
+                time.sleep(retry_backoff_sec)
+
+    if xml_text is None:
+        logger.warning("treasury.gov unreachable after %d attempt(s), last error: %s", max_attempts, last_error)
+        return None
 
     # Each <entry> has NEW_DATE, BC_5YEAR, BC_10YEAR - simple regex extraction, avoids
     # pulling in an XML namespace-heavy parser for a well-known, stable feed shape.
