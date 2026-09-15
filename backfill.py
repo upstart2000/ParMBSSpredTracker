@@ -13,7 +13,7 @@ FINRA_IDS_STAR-YYYYMMDD.xlsx we don't need) per trading day. Each is parsed
 in-memory (no need to unzip to disk) and upserted via the same
 pipeline.build_daily_record() the nightly job uses.
 
-TODO: reprocess 2026-09-09 through 2026-09-14 once the 202609 monthly zip is
+TODO: reprocess 2026-09-09 through 2026-09-13 once the 202609 monthly zip is
 published. Those rows are currently sitting in the db computed under the old
 (pre-fix) logic in two ways: settlement_calendar.py was still selecting the
 expiring month as "near" all the way through its own settlement date instead
@@ -22,7 +22,9 @@ before settlement, not at it" PR), and finra_parser.compute_par_coupon()
 returned None instead of extrapolating whenever every available coupon
 bucket priced on the same side of par (see the "extrapolate par coupon off
 bracket" PR). Run with --months 202609 --no-skip-existing once that zip
-exists, to overwrite them with both fixes applied.
+exists, to overwrite them with both fixes applied. (2026-09-14 itself was
+already recovered directly from the live daily endpoint, which still had
+that date's data at the time - no archive needed for that one day.)
 """
 import argparse
 import io
