@@ -103,8 +103,13 @@ def parse_coupon_curve(curve_json):
     Deserializes a coupon_curve_raw/coupon_curve_normalized cell (JSON object
     with string coupon keys, as written by pipeline.py) back into a
     {float coupon: float price} dict. Returns {} for None/empty input.
+
+    A SQL NULL read straight from sqlite3 comes through as None, but the same
+    NULL read via pandas (streamlit_app.py's df, built from these rows) comes
+    through as NaN - a float, and `not float('nan')` is False, so the None
+    check alone lets NaN slip past it into json.loads(). Guard for that too.
     """
-    if not curve_json:
+    if not curve_json or isinstance(curve_json, float):
         return {}
     return {float(c): p for c, p in json.loads(curve_json).items()}
 

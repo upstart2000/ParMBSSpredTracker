@@ -65,7 +65,12 @@ def _quarter_label(d):
 def bracket_coupons(row, suffix):
     if row is None:
         return set()
-    return {row.get(f"coupon_low_{suffix}"), row.get(f"coupon_high_{suffix}")} - {None}
+    # pd.notna (not a plain `- {None}` set-difference) because a missing bracket
+    # bound comes through as NaN when row is sourced from the pandas df (today_row/
+    # prior_row), not None - and NaN != NaN, so a bare set-difference against {None}
+    # lets distinct NaNs pile up across rows, producing duplicate "UMBS nan" columns
+    # that pandas' Styler.apply then rejects as non-unique.
+    return {c for c in (row.get(f"coupon_low_{suffix}"), row.get(f"coupon_high_{suffix}")) if pd.notna(c)}
 
 
 def snapshot_row_values(row, suffix, coupon_union):
