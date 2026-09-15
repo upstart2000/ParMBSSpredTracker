@@ -108,9 +108,17 @@ def compute_par_coupon(coupon_prices):
     """
     Linear interpolation between the coupon bucket just below par (price <= 100)
     and the one just above (price > 100), among usable (non-suppressed, non-zero) buckets.
-    Returns None if no valid bracketing pair exists (e.g. all coupons priced above or below par).
+
+    If every available bucket sits on the same side of par - e.g. current rates
+    put even the highest-coupon bucket (UMBS 6.0) below 100, or a sharp rally
+    puts even the lowest-coupon bucket above 100 - there's no true bracket to
+    interpolate within. Falls back to extrapolating along the same line using
+    the two buckets nearest par on that side (the two highest coupons when all
+    are below par, the two lowest when all are above). Returns None only when
+    fewer than two usable buckets exist at all, or the two chosen buckets are
+    priced identically (degenerate, divide-by-zero).
     """
-    if not coupon_prices:
+    if not coupon_prices or len(coupon_prices) < 2:
         return None
 
     coupons_sorted = sorted(coupon_prices.keys())
@@ -124,8 +132,14 @@ def compute_par_coupon(coupon_prices):
             c_high, p_high = c, p  # first coupon above par, immediately after the sub-100 run
             break
 
-    if c_low is None or c_high is None:
-        return None  # par coupon out of range of available brackets
+    if c_low is None:
+        # every bucket prices above par - extrapolate using the two lowest coupons
+        c_low, c_high = coupons_sorted[0], coupons_sorted[1]
+        p_low, p_high = coupon_prices[c_low], coupon_prices[c_high]
+    elif c_high is None:
+        # every bucket prices at/below par - extrapolate using the two highest coupons
+        c_high, c_low = coupons_sorted[-1], coupons_sorted[-2]
+        p_high, p_low = coupon_prices[c_high], coupon_prices[c_low]
 
     if p_high == p_low:
         return None  # degenerate, avoid divide-by-zero
