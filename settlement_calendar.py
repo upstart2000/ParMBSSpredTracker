@@ -5,6 +5,7 @@ Published ~12 months ahead by SIFMA. Extend this dict as new dates are published
 (or replace with a loader that pulls the SIFMA XLSX directly - see note at bottom).
 """
 from datetime import date
+from functools import lru_cache
 
 # month_label matches the FINRA file's settlement labels ("July", "August", ...)
 CLASS_A_SETTLEMENT_DATES_2026 = {
@@ -22,6 +23,49 @@ CLASS_A_SETTLEMENT_DATES_2026 = {
     "December":  date(2026, 12, 10),
 }
 
+# MBSCC "good delivery" notification for a Class A pass-through is 2 SIFMA
+# business days before settlement (the "48-hour rule"). Desks roll out of the
+# expiring month ahead of notification, not on it, so by convention the front
+# month should stop being treated as "near" one business day earlier still -
+# i.e. 3 SIFMA business days before settlement. Confirmed against real data:
+# September settles 2026-09-14 (notification 2026-09-10); FINRA's September
+# TBA column was already thin/unusable by 2026-09-14 because desks had rolled
+# to October days earlier, and get_near_month_settlement() was still trying
+# September through then instead of switching on 2026-09-09.
+ROLL_BUSINESS_DAYS_BEFORE_SETTLEMENT = 3
+
+
+@lru_cache(maxsize=1)
+def _sifma_trading_days():
+    """
+    Cached sorted tuple of SIFMA_US trading days spanning (and padded a month
+    on either side of) the settlement calendar's covered range. Used to count
+    real bond-market business days back from a settlement date for
+    roll_date() - a plain Mon-Fri skip would get the wrong answer whenever the
+    lookback window crosses a bond holiday that isn't an equity holiday (e.g.
+    Columbus Day, Veterans Day - see the similar note in nightly_job.py's
+    is_sifma_holiday()).
+    """
+    import pandas_market_calendars as mcal
+
+    cal = mcal.get_calendar("SIFMA_US")
+    years = sorted({d.year for d in CLASS_A_SETTLEMENT_DATES_2026.values()})
+    start = date(years[0] - 1, 12, 1)
+    end = date(years[-1] + 1, 1, 31)
+    schedule = cal.schedule(start_date=start, end_date=end)
+    return tuple(ts.date() for ts in schedule.index)
+
+
+def roll_date(settlement_date, business_days_before=ROLL_BUSINESS_DAYS_BEFORE_SETTLEMENT):
+    """
+    The date on/after which a month's TBA contract should no longer be
+    selected as the "near" month for pricing - business_days_before SIFMA
+    trading days before its settlement date.
+    """
+    trading_days = _sifma_trading_days()
+    idx = trading_days.index(settlement_date)
+    return trading_days[idx - business_days_before]
+
 
 def get_near_month_settlement(parsed_coupon_data, today=None, settlement_dates=None):
     """
@@ -31,7 +75,14 @@ def get_near_month_settlement(parsed_coupon_data, today=None, settlement_dates=N
     settlement_dates: dict month_label -> settlement date (defaults to CLASS_A_SETTLEMENT_DATES_2026)
 
     Selection rule:
-      1. Start with the earliest settlement month whose date >= today.
+      1. Start with the earliest settlement month that hasn't rolled off yet -
+         i.e. today is still before that month's roll_date() (3 SIFMA business
+         days ahead of its settlement, ahead of the ~48-hour notification
+         date desks actually roll on). This is deliberately *not* "settlement
+         date >= today": by the time a month actually settles, real trading
+         has already moved to the next month days earlier, and the FINRA
+         column for the settling month is typically too thin/rolled-off to
+         price against.
       2. If that month's data doesn't yield a computable par coupon (thin/rolled-off data),
          fall through to the next month in the FINRA file, in order.
       3. Returns (month_label, coupon_prices) or (None, None) if nothing usable is found.
@@ -49,10 +100,10 @@ def get_near_month_settlement(parsed_coupon_data, today=None, settlement_dates=N
     ]
     candidates.sort()
 
-    # Start from the earliest month whose settlement date hasn't passed yet.
-    on_or_after_today = [m for d, m in candidates if d >= today]
+    # Start from the earliest month that hasn't rolled off yet (see roll_date()).
+    not_yet_rolled = [m for d, m in candidates if today < roll_date(d)]
     # Fall back to file order if calendar coverage is short (e.g. testing on stale data).
-    ordered_months = on_or_after_today if on_or_after_today else [m for _, m in candidates]
+    ordered_months = not_yet_rolled if not_yet_rolled else [m for _, m in candidates]
 
     for month in ordered_months:
         coupon_prices = parsed_coupon_data[month]
