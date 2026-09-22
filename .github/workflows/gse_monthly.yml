@@ -1,0 +1,59 @@
+name: Monthly GSE retained portfolio update
+
+# Fannie Mae and Freddie Mac each publish their monthly investor summary
+# roughly 25-30 days after month-end, not on a fixed calendar day - observed
+# publish dates for recent months (via each GSE's own press release):
+#   Fannie Mae:   May 2026 -> Jun 26, 2026   June 2026 -> Jul 30, 2026   July 2026 -> Aug 26, 2026
+#   Freddie Mac:  May 2026 -> Jun 25, 2026   June 2026 -> Jul 27, 2026   July 2026 -> Aug 25, 2026
+# So instead of guessing one exact day, this runs once daily across a window
+# that comfortably brackets that range - the 24th through the end of the
+# month, and the 1st through the 5th of the following month - and is a cheap
+# no-op on every day nothing new has posted yet (gse_portfolio_update.py just
+# checks the next month's predictable URL and exits cleanly if it 404s).
+# Two cron lines per window (like nightly.yml) so one is always the "real"
+# firing for the current EDT/EST offset - GitHub Actions cron is UTC-only
+# and doesn't shift for daylight saving.
+on:
+  schedule:
+    - cron: '0 22 24-31 * *'  # 6:00 PM EDT, 24th-31st
+    - cron: '0 23 24-31 * *'  # 6:00 PM EST, 24th-31st
+    - cron: '0 22 1-5 * *'    # 6:00 PM EDT, 1st-5th
+    - cron: '0 23 1-5 * *'    # 6:00 PM EST, 1st-5th
+  workflow_dispatch: {}       # manual trigger for testing / catch-up runs
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gse-monthly-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run GSE portfolio update
+        run: python gse_portfolio_update.py
+
+      - name: Commit and push updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add gse_retained_portfolio.csv
+          if git diff --cached --quiet; then
+            echo "No changes to commit (new month not published yet, or already up to date)."
+          else
+            git commit -m "GSE portfolio data update: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi

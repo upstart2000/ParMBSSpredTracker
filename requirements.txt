@@ -7,3 +7,4 @@ pandas==3.0.3
 pyarrow==23.0.1
 numpy==2.5.1
 pandas_market_calendars==5.4.0
+pdfplumber==0.11.10
