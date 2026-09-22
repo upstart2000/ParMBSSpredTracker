@@ -5,6 +5,10 @@ Reads directly from the repo's mbs_spreads.db (populated by nightly_job.py /
 backfill.py). Designed to run unmodified on Streamlit Community Cloud: the db
 path is relative to the repo root, which is the working directory both
 locally and on Cloud.
+
+Second tab (GSE Retained Portfolios) reads gse_retained_portfolio.csv - a
+separate, manually-curated dataset (not part of the nightly FINRA/Treasury
+pipeline). See that file's own header for provenance/refresh notes.
 """
 import os
 from datetime import date
@@ -50,6 +54,9 @@ SERIES_OPTIONS = {
 
 SPREAD_COLUMNS = ["Spread vs 5yr (bps)", "Spread vs 10yr (bps)", "Spread vs 5/10yr (bps)"]
 COMPUTED_ROW_LABELS = {"Daily Change", "Prior Quarter Change", "QTD Change"}
+
+GSE_PORTFOLIO_CSV = "gse_retained_portfolio.csv"
+ISSUER_LABELS = {"FNMA": "Fannie Mae", "FHLMC": "Freddie Mac"}
 
 
 def _row_date(row):
@@ -179,126 +186,217 @@ def qtd_metric(label, value, unit, qtd_chg):
     st.metric(label=label, value=value_str, delta=delta_str)
 
 
-st.title("MBS Spread Tracker")
+@st.cache_data(show_spinner=False)
+def _load_gse_portfolio(csv_path, mtime):
+    df = pd.read_csv(csv_path, parse_dates=["month"])
+    return df
 
-df = load_dataframe()
 
-if df.empty:
-    st.warning(f"No data found in {db.DEFAULT_DB_PATH} yet. Run backfill.py and/or nightly_job.py first.")
-    st.stop()
+def load_gse_portfolio(csv_path=GSE_PORTFOLIO_CSV):
+    mtime = os.path.getmtime(csv_path) if os.path.exists(csv_path) else None
+    return _load_gse_portfolio(csv_path, mtime)
 
-latest_rows = df.tail(2).to_dict("records")
-today_row = latest_rows[-1]
-prior_row = latest_rows[-2] if len(latest_rows) > 1 else None
 
-# Gap-detection logic stays fully intact and still runs here - only its display
-# moved (to the bottom of the page, see the end of this script).
-gap_warning = None
-if prior_row is not None:
-    gap_days = (today_row["finra_date"].date() - prior_row["finra_date"].date()).days
-    if gap_days > db.MAX_EXPECTED_GAP_DAYS:
-        gap_warning = (
-            f"⚠️ Data gap: {gap_days} calendar days between {prior_row['finra_date'].date()} and "
-            f"{today_row['finra_date'].date()} - wider than a normal weekend/holiday, so one or more "
-            "trading days are missing from the dataset. The 'Delta' row below and the QTD changes "
-            "reflect the full gap, not a single day's move."
+def gse_wide(gse_df, value_col):
+    """Pivot to one column per issuer plus a Sum column, indexed by month, sorted chronologically."""
+    wide = gse_df.pivot(index="month", columns="issuer", values=value_col).sort_index()
+    wide["Sum"] = wide.get("FNMA", 0) + wide.get("FHLMC", 0)
+    return wide
+
+
+def gse_portfolio_chart(wide_df, yaxis_title):
+    fig = go.Figure()
+    series = [
+        ("FNMA", "Fannie Mae", COLOR_SPREAD_5YR),
+        ("FHLMC", "Freddie Mac", COLOR_SPREAD_10YR),
+        ("Sum", "Fannie Mae + Freddie Mac", COLOR_SPREAD_AVG),
+    ]
+    for col, name, color in series:
+        fig.add_trace(
+            go.Scatter(
+                x=wide_df.index,
+                y=wide_df[col],
+                mode="lines+markers",
+                name=name,
+                line=dict(color=color, width=2),
+                marker=dict(symbol="diamond-open", size=8, line=dict(width=1.5, color=color)),
+            )
         )
+    fig.update_layout(
+        xaxis_title="Month",
+        yaxis_title=yaxis_title,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(t=60, b=40),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor=GRIDLINE, zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor=GRIDLINE, zeroline=True, zerolinecolor=GRIDLINE)
+    return fig
 
-# The Raw/Normalized selector widget itself renders further down (near the
-# historical chart), but its value is needed up here for the QTD section and
-# Daily Snapshot table. Streamlit persists widget state in session_state
-# across reruns, so reading it via the widget's key before the widget is
-# instantiated later in this same run still reflects the current selection.
-DEFAULT_SERIES_CHOICE = next(iter(SERIES_OPTIONS))
-series_choice = st.session_state.get("series_choice_widget", DEFAULT_SERIES_CHOICE)
-suffix = SERIES_OPTIONS[series_choice]
 
-# --- QTD change section (prominent, up top) ---
-if today_row.get("qtd_ref_date") is None:
-    st.info("No prior-quarter baseline available yet for this dataset - QTD change can't be computed for the current quarter's first stretch of data.")
-else:
-    cols = st.columns(5)
-    with cols[0]:
-        qtd_metric("5yr UST", today_row.get("ust_5yr"), "%", today_row.get("qtd_chg_ust_5yr"))
-    with cols[1]:
-        qtd_metric("10yr UST", today_row.get("ust_10yr"), "%", today_row.get("qtd_chg_ust_10yr"))
-    with cols[2]:
-        qtd_metric("Spread vs 5yr", today_row.get(f"spread_5yr_{suffix}"), " bps", today_row.get(f"qtd_chg_spread_5yr_{suffix}"))
-    with cols[3]:
-        qtd_metric("Spread vs 10yr", today_row.get(f"spread_10yr_{suffix}"), " bps", today_row.get(f"qtd_chg_spread_10yr_{suffix}"))
-    with cols[4]:
-        qtd_metric("Spread vs 5/10yr", today_row.get(f"spread_avg_{suffix}"), " bps", today_row.get(f"qtd_chg_spread_avg_{suffix}"))
+tab1, tab2 = st.tabs(["MBS Spread Tracker", "GSE Retained Portfolios"])
 
-st.divider()
+with tab1:
+    st.title("MBS Spread Tracker")
 
-# --- Daily table ---
-current_qe, prior_qe = db.get_quarter_end_rows(today_row["finra_date"].date())
-daily_table = build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix)
-st.dataframe(style_daily_table(daily_table), width="stretch")
+    df = load_dataframe()
 
-st.divider()
+    if df.empty:
+        st.warning(f"No data found in {db.DEFAULT_DB_PATH} yet. Run backfill.py and/or nightly_job.py first.")
+        st.stop()
 
-# --- Historical chart ---
-st.subheader("Historical Spread")
+    latest_rows = df.tail(2).to_dict("records")
+    today_row = latest_rows[-1]
+    prior_row = latest_rows[-2] if len(latest_rows) > 1 else None
 
-st.radio(
-    "Par coupon / spread series",
-    options=list(SERIES_OPTIONS.keys()),
-    horizontal=True,
-    key="series_choice_widget",
-    help=(
-        "Raw uses whichever settlement month is nearest today - the implied price drifts as "
-        "days-to-settlement shrink toward the next roll, then jumps at the roll (a sawtooth "
-        "artifact on top of real spread movement). Normalized interpolates near/next month "
-        "prices to a fixed 30-day-to-settlement horizon, removing that artifact."
-    ),
-)
+    # Gap-detection logic stays fully intact and still runs here - only its display
+    # moved (to the bottom of the page, see the end of this script).
+    gap_warning = None
+    if prior_row is not None:
+        gap_days = (today_row["finra_date"].date() - prior_row["finra_date"].date()).days
+        if gap_days > db.MAX_EXPECTED_GAP_DAYS:
+            gap_warning = (
+                f"⚠️ Data gap: {gap_days} calendar days between {prior_row['finra_date'].date()} and "
+                f"{today_row['finra_date'].date()} - wider than a normal weekend/holiday, so one or more "
+                "trading days are missing from the dataset. The 'Delta' row below and the QTD changes "
+                "reflect the full gap, not a single day's move."
+            )
 
-fig = go.Figure()
-series = [
-    (f"spread_5yr_{suffix}", "Spread vs 5yr", COLOR_SPREAD_5YR),
-    (f"spread_10yr_{suffix}", "Spread vs 10yr", COLOR_SPREAD_10YR),
-    (f"spread_avg_{suffix}", "Spread vs 5/10yr", COLOR_SPREAD_AVG),
-]
-for col, name, color in series:
-    fig.add_trace(
-        go.Scatter(
-            x=df["finra_date"],
-            y=df[col],
-            mode="lines+markers",
-            name=name,
-            line=dict(color=color, width=2),
-            marker=dict(symbol="diamond-open", size=8, line=dict(width=1.5, color=color)),
-        )
+    # The Raw/Normalized selector widget itself renders further down (near the
+    # historical chart), but its value is needed up here for the QTD section and
+    # Daily Snapshot table. Streamlit persists widget state in session_state
+    # across reruns, so reading it via the widget's key before the widget is
+    # instantiated later in this same run still reflects the current selection.
+    DEFAULT_SERIES_CHOICE = next(iter(SERIES_OPTIONS))
+    series_choice = st.session_state.get("series_choice_widget", DEFAULT_SERIES_CHOICE)
+    suffix = SERIES_OPTIONS[series_choice]
+
+    # --- QTD change section (prominent, up top) ---
+    if today_row.get("qtd_ref_date") is None:
+        st.info("No prior-quarter baseline available yet for this dataset - QTD change can't be computed for the current quarter's first stretch of data.")
+    else:
+        cols = st.columns(5)
+        with cols[0]:
+            qtd_metric("5yr UST", today_row.get("ust_5yr"), "%", today_row.get("qtd_chg_ust_5yr"))
+        with cols[1]:
+            qtd_metric("10yr UST", today_row.get("ust_10yr"), "%", today_row.get("qtd_chg_ust_10yr"))
+        with cols[2]:
+            qtd_metric("Spread vs 5yr", today_row.get(f"spread_5yr_{suffix}"), " bps", today_row.get(f"qtd_chg_spread_5yr_{suffix}"))
+        with cols[3]:
+            qtd_metric("Spread vs 10yr", today_row.get(f"spread_10yr_{suffix}"), " bps", today_row.get(f"qtd_chg_spread_10yr_{suffix}"))
+        with cols[4]:
+            qtd_metric("Spread vs 5/10yr", today_row.get(f"spread_avg_{suffix}"), " bps", today_row.get(f"qtd_chg_spread_avg_{suffix}"))
+
+    st.divider()
+
+    # --- Daily table ---
+    current_qe, prior_qe = db.get_quarter_end_rows(today_row["finra_date"].date())
+    daily_table = build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix)
+    st.dataframe(style_daily_table(daily_table), width="stretch")
+
+    st.divider()
+
+    # --- Historical chart ---
+    st.subheader("Historical Spread")
+
+    st.radio(
+        "Par coupon / spread series",
+        options=list(SERIES_OPTIONS.keys()),
+        horizontal=True,
+        key="series_choice_widget",
+        help=(
+            "Raw uses whichever settlement month is nearest today - the implied price drifts as "
+            "days-to-settlement shrink toward the next roll, then jumps at the roll (a sawtooth "
+            "artifact on top of real spread movement). Normalized interpolates near/next month "
+            "prices to a fixed 30-day-to-settlement horizon, removing that artifact."
+        ),
     )
 
-fig.update_layout(
-    xaxis_title="Date",
-    yaxis_title="Spread (bps)",
-    hovermode="x unified",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(0,0,0,0)",
-    margin=dict(t=60, b=40),
-)
-fig.update_xaxes(showgrid=True, gridcolor=GRIDLINE, zeroline=False)
-fig.update_yaxes(showgrid=True, gridcolor=GRIDLINE, zeroline=True, zerolinecolor=GRIDLINE)
-
-st.plotly_chart(fig, width="stretch")
-
-if suffix == "normalized":
-    missing_count = int(df[f"par_coupon_{suffix}"].isna().sum())
-    if missing_count:
-        st.caption(
-            f"Normalized par coupon isn't computable for {missing_count} historical day(s) "
-            "(missing/thin next-month data that day) - those show as gaps in the lines above, "
-            "not zeros or an error."
+    fig = go.Figure()
+    series = [
+        (f"spread_5yr_{suffix}", "Spread vs 5yr", COLOR_SPREAD_5YR),
+        (f"spread_10yr_{suffix}", "Spread vs 10yr", COLOR_SPREAD_10YR),
+        (f"spread_avg_{suffix}", "Spread vs 5/10yr", COLOR_SPREAD_AVG),
+    ]
+    for col, name, color in series:
+        fig.add_trace(
+            go.Scatter(
+                x=df["finra_date"],
+                y=df[col],
+                mode="lines+markers",
+                name=name,
+                line=dict(color=color, width=2),
+                marker=dict(symbol="diamond-open", size=8, line=dict(width=1.5, color=color)),
+            )
         )
 
-with st.expander("Show underlying data"):
-    curve_cols = ["coupon_curve_raw", "coupon_curve_normalized"]
-    st.dataframe(df.drop(columns=curve_cols), width="stretch")
+    fig.update_layout(
+        xaxis_title="Date",
+        yaxis_title="Spread (bps)",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(t=60, b=40),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor=GRIDLINE, zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor=GRIDLINE, zeroline=True, zerolinecolor=GRIDLINE)
 
-st.divider()
-if gap_warning:
-    st.warning(gap_warning)
+    st.plotly_chart(fig, width="stretch")
+
+    if suffix == "normalized":
+        missing_count = int(df[f"par_coupon_{suffix}"].isna().sum())
+        if missing_count:
+            st.caption(
+                f"Normalized par coupon isn't computable for {missing_count} historical day(s) "
+                "(missing/thin next-month data that day) - those show as gaps in the lines above, "
+                "not zeros or an error."
+            )
+
+    with st.expander("Show underlying data"):
+        curve_cols = ["coupon_curve_raw", "coupon_curve_normalized"]
+        st.dataframe(df.drop(columns=curve_cols), width="stretch")
+
+    st.divider()
+    if gap_warning:
+        st.warning(gap_warning)
+
+with tab2:
+    st.title("GSE Retained Portfolios")
+    st.caption(
+        "Monthly retained/mortgage-related-investments portfolio composition for Fannie Mae and "
+        "Freddie Mac, sourced from each GSE's own monthly investor summary - Fannie Mae \"Monthly "
+        "Summary\" Table 4 (Retained Mortgage Portfolio Composition) and Freddie Mac \"Monthly "
+        "Volume Summary\" Table 3 (Mortgage-Related Investments Portfolio Components). Pulled once "
+        "from the July 2026 editions of each, which carried a trailing 13-month history "
+        "(July 2025-July 2026); not part of the nightly FINRA/Treasury pipeline, so it won't update "
+        "on its own - see gse_retained_portfolio.csv to refresh from a later monthly summary."
+    )
+
+    gse_df = load_gse_portfolio()
+
+    if gse_df.empty:
+        st.warning(f"No data found in {GSE_PORTFOLIO_CSV}.")
+    else:
+        agency_billions = gse_wide(gse_df, "agency_securities") / 1000
+        balance_billions = gse_wide(gse_df, "retained_portfolio_end_balance") / 1000
+
+        st.subheader("Agency Securities Holdings")
+        st.plotly_chart(
+            gse_portfolio_chart(agency_billions, "Agency securities ($ billions)"),
+            width="stretch",
+        )
+
+        st.subheader("Retained Mortgage Portfolio Balance")
+        st.plotly_chart(
+            gse_portfolio_chart(balance_billions, "Retained portfolio end balance ($ billions)"),
+            width="stretch",
+        )
+
+        with st.expander("Show underlying data"):
+            display_df = gse_df.copy()
+            display_df["month"] = display_df["month"].dt.strftime("%Y-%m")
+            display_df["issuer"] = display_df["issuer"].map(ISSUER_LABELS).fillna(display_df["issuer"])
+            st.dataframe(display_df, width="stretch")
