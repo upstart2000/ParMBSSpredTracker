@@ -1,12 +1,12 @@
 """
-One-time historical backfill of daily_spreads from FINRA's monthly zip
-archives (https://cdn.finra.org/trace/ids/monthly/HISTORIC_SPREPORTS-YYYYMM.zip).
+Historical backfill of daily_spreads from FINRA's monthly zip archives
+(https://cdn.finra.org/trace/ids/monthly/HISTORIC_SPREPORTS-YYYYMM.zip).
 
-Scoped to 2026 only: months are probed sequentially (202601, 202602, ...) and
-the run stops at the first month whose zip isn't published yet. This also
-keeps settlement-month selection simple, since settlement_calendar.py's
-CLASS_A_SETTLEMENT_DATES_2026 only covers 2026 - no need to reconcile a
-different year's settlement calendar here.
+Months are probed sequentially from --start (default 201701, the earliest
+month settlement_calendar.CLASS_A_SETTLEMENT_DATES covers) up to --end
+(default: the current month), and the run stops at the first month whose zip
+isn't published yet (months publish in order, only after that month has
+fully closed).
 
 Each monthly zip contains one FINRA_IDS_PXTABLES-YYYYMMDD.xlsx (plus a
 FINRA_IDS_STAR-YYYYMMDD.xlsx we don't need) per trading day. Each is parsed
@@ -41,20 +41,32 @@ from pipeline import build_daily_record
 
 MONTHLY_ZIP_URL = "https://cdn.finra.org/trace/ids/monthly/HISTORIC_SPREPORTS-{yyyymm}.zip"
 PXTABLES_NAME_RE = re.compile(r"^FINRA_IDS_PXTABLES-(\d{8})\.xlsx$")
-BACKFILL_YEAR = 2026
+DEFAULT_START_MONTH = "201701"
 
 logger = logging.getLogger("backfill")
 
 
-def available_months(year=BACKFILL_YEAR):
-    """
-    Probes HISTORIC_SPREPORTS-<year><01..12>.zip and returns the yyyymm strings
-    that exist, stopping at the first missing month (months publish in order,
-    only after that month has fully closed).
-    """
+def _month_range(start_yyyymm, end_yyyymm):
+    """Inclusive list of yyyymm strings from start to end."""
+    y, m = int(start_yyyymm[:4]), int(start_yyyymm[4:])
+    end_y, end_m = int(end_yyyymm[:4]), int(end_yyyymm[4:])
     months = []
-    for mm in range(1, 13):
-        yyyymm = f"{year}{mm:02d}"
+    while (y, m) <= (end_y, end_m):
+        months.append(f"{y}{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return months
+
+
+def available_months(start=DEFAULT_START_MONTH, end=None):
+    """
+    Probes HISTORIC_SPREPORTS-<yyyymm>.zip for each month from start through
+    end (default: the current month) and returns the yyyymm strings that
+    exist, stopping at the first missing month (months publish in order, only
+    after that month has fully closed).
+    """
+    end = end or datetime.now().strftime("%Y%m")
+    months = []
+    for yyyymm in _month_range(start, end):
         url = MONTHLY_ZIP_URL.format(yyyymm=yyyymm)
         resp = requests.head(url, timeout=20)
         if resp.status_code == 200:
@@ -127,9 +139,9 @@ def backfill_month(yyyymm, db_path=db.DEFAULT_DB_PATH, skip_existing=True):
     return written, skipped, failed
 
 
-def run_backfill(db_path=db.DEFAULT_DB_PATH, months=None, skip_existing=True, year=BACKFILL_YEAR):
+def run_backfill(db_path=db.DEFAULT_DB_PATH, months=None, skip_existing=True, start=DEFAULT_START_MONTH, end=None):
     db.init_db(db_path)
-    months = months if months is not None else available_months(year)
+    months = months if months is not None else available_months(start, end)
     logger.info("Backfilling months: %s", months)
 
     total_written = total_skipped = total_failed = 0
@@ -139,6 +151,10 @@ def run_backfill(db_path=db.DEFAULT_DB_PATH, months=None, skip_existing=True, ye
         total_written += written
         total_skipped += skipped
         total_failed += failed
+
+    qtd_filled = db.fill_missing_qtd(db_path=db_path)
+    if qtd_filled:
+        logger.info("Filled QTD fields for %d existing row(s) that now have a prior-quarter baseline", qtd_filled)
 
     logger.info(
         "Backfill complete: %d written, %d skipped, %d failed across %d month(s)",
@@ -156,16 +172,21 @@ def _setup_logging():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="One-time historical backfill (2026) from FINRA monthly zip archives")
+    parser = argparse.ArgumentParser(description="Historical backfill from FINRA monthly zip archives")
     parser.add_argument("--db-path", default=db.DEFAULT_DB_PATH)
-    parser.add_argument("--months", nargs="+", help="explicit yyyymm list, e.g. --months 202601 202602 (default: auto-probe all available 2026 months)")
+    parser.add_argument("--start", default=DEFAULT_START_MONTH, help=f"first yyyymm to probe (default: {DEFAULT_START_MONTH})")
+    parser.add_argument("--end", help="last yyyymm to probe (default: current month)")
+    parser.add_argument("--months", nargs="+", help="explicit yyyymm list, e.g. --months 202601 202602 (overrides --start/--end)")
     parser.add_argument("--no-skip-existing", action="store_true", help="re-process and overwrite days already in the db")
     args = parser.parse_args()
 
     _setup_logging()
 
     try:
-        run_backfill(db_path=args.db_path, months=args.months, skip_existing=not args.no_skip_existing)
+        run_backfill(
+            db_path=args.db_path, months=args.months, skip_existing=not args.no_skip_existing,
+            start=args.start, end=args.end,
+        )
     except Exception:
         logger.exception("Backfill failed")
         sys.exit(1)

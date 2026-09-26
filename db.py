@@ -226,6 +226,33 @@ def compute_qtd_fields(record, db_path=DEFAULT_DB_PATH):
     }
 
 
+def fill_missing_qtd(db_path=DEFAULT_DB_PATH):
+    """
+    Recomputes QTD fields for rows that were written without a prior-quarter
+    baseline (qtd_ref_date NULL) but now have one - e.g. the first quarter a
+    dataset covered, after a backfill adds older history underneath it. Only
+    the qtd_* columns are touched. Returns the number of rows updated.
+    """
+    with _connect(db_path) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM daily_spreads WHERE qtd_ref_date IS NULL ORDER BY finra_date ASC"
+        )]
+
+    updated = 0
+    for row in rows:
+        fields = compute_qtd_fields(row, db_path=db_path)
+        if fields["qtd_ref_date"] is None:
+            continue
+        set_clause = ", ".join(f"{k}=:{k}" for k in fields)
+        with _connect(db_path) as conn:
+            conn.execute(
+                f"UPDATE daily_spreads SET {set_clause} WHERE finra_date=:finra_date",
+                {**fields, "finra_date": row["finra_date"]},
+            )
+        updated += 1
+    return updated
+
+
 _COLUMNS = [
     "finra_date", "settlement_month", "next_settlement_month", "days_to_near", "days_to_next",
     "ust_5yr", "ust_10yr", "ust_source", "ust_stale",
@@ -293,6 +320,28 @@ def get_latest(n=2, db_path=DEFAULT_DB_PATH):
 MAX_EXPECTED_GAP_DAYS = 4  # a normal weekend is 3; a Monday/Friday holiday + weekend is 4
 
 
+# Documented stretches of history with no usable par coupon, as
+# (first_date, last_date, reason). Days inside these are expected to be
+# missing and are left out of gap/missing-data warnings. Each is a period
+# where par sat more than finra_parser.MAX_EXTRAPOLATION past the coupons
+# FINRA quoted (found from the 2017-2025 backfill; a stretch may still
+# contain some computable days).
+_BELOW_RANGE = "par coupon was below the lowest coupon FINRA quoted, too far out to estimate"
+_ABOVE_RANGE = "par coupon was above the highest coupon FINRA quoted, too far out to estimate"
+KNOWN_DATA_GAPS = [
+    (date(2019, 8, 2), date(2019, 11, 21), _BELOW_RANGE),
+    (date(2020, 1, 2), date(2021, 2, 12), _BELOW_RANGE),
+    (date(2022, 9, 15), date(2022, 11, 11), _ABOVE_RANGE),
+    (date(2023, 8, 15), date(2023, 11, 13), _ABOVE_RANGE),
+    (date(2024, 4, 15), date(2024, 5, 1), _ABOVE_RANGE),
+]
+
+
+def in_known_gap(d):
+    """True if date d falls inside one of KNOWN_DATA_GAPS."""
+    return any(start <= d <= end for start, end, _ in KNOWN_DATA_GAPS)
+
+
 def find_date_gaps(db_path=DEFAULT_DB_PATH, max_expected_gap_days=MAX_EXPECTED_GAP_DAYS):
     """
     Scans all stored dates in order and returns a list of
@@ -311,7 +360,7 @@ def find_date_gaps(db_path=DEFAULT_DB_PATH, max_expected_gap_days=MAX_EXPECTED_G
     gaps = []
     for prev_date, next_date in zip(dates, dates[1:]):
         gap_days = (next_date - prev_date).days
-        if gap_days > max_expected_gap_days:
+        if gap_days > max_expected_gap_days and not (in_known_gap(prev_date) or in_known_gap(next_date)):
             gaps.append((prev_date, next_date, gap_days))
     return gaps
 

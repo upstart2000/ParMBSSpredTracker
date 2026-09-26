@@ -24,7 +24,9 @@ does not replace the raw one.
 import json
 
 from finra_parser import parse_tba_30y_umbs, compute_par_coupon, get_data_as_of_date
-from settlement_calendar import CLASS_A_SETTLEMENT_DATES_2026, get_near_month_settlement, get_next_settlement_month
+from settlement_calendar import (
+    CLASS_A_SETTLEMENT_DATES, get_near_month_settlement, get_next_settlement_month, settlement_date_for,
+)
 from treasury_rates import get_treasury_rates
 from db import compute_spreads
 
@@ -72,7 +74,7 @@ def build_normalized_leg(parsed, near_month, finra_date, settlement_dates=None, 
     between the two months) - that's a real gap, not silently guessed at.
     """
     if settlement_dates is None:
-        settlement_dates = CLASS_A_SETTLEMENT_DATES_2026
+        settlement_dates = CLASS_A_SETTLEMENT_DATES
 
     result = {
         "next_settlement_month": None,
@@ -86,16 +88,17 @@ def build_normalized_leg(parsed, near_month, finra_date, settlement_dates=None, 
         "coupon_curve_normalized": {},
     }
 
-    if near_month is None or near_month not in settlement_dates:
+    near_date = settlement_date_for(near_month, finra_date, settlement_dates) if near_month else None
+    if near_date is None:
         return result
 
-    next_month = get_next_settlement_month(near_month, settlement_dates)
+    next_month = get_next_settlement_month(near_month, finra_date, settlement_dates)
     result["next_settlement_month"] = next_month
     if next_month is None or next_month not in parsed or near_month not in parsed:
         return result
 
-    days_to_near = (settlement_dates[near_month] - finra_date).days
-    days_to_next = (settlement_dates[next_month] - finra_date).days
+    days_to_near = (near_date - finra_date).days
+    days_to_next = (settlement_date_for(next_month, finra_date, settlement_dates) - finra_date).days
     result["days_to_near"] = days_to_near
     result["days_to_next"] = days_to_next
 
@@ -128,8 +131,7 @@ def build_daily_record(filepath, finra_date=None, allow_yahoo_fallback=True, set
                 file's own "DATA AS OF:" banner via get_data_as_of_date().
     settlement_dates: optional override dict passed through to
                        get_near_month_settlement / the normalization leg
-                       (e.g. a historical settlement calendar; defaults to
-                       the 2026 calendar).
+                       (defaults to settlement_calendar.CLASS_A_SETTLEMENT_DATES).
 
     Returns a dict matching db.upsert_day()'s expected keys, with parallel
     _raw and _normalized par-coupon/spread series. Fields that couldn't be

@@ -59,6 +59,24 @@ GSE_PORTFOLIO_CSV = "gse_retained_portfolio.csv"
 ISSUER_LABELS = {"FNMA": "Fannie Mae", "FHLMC": "Freddie Mac"}
 
 
+# Historical chart window presets -> months back from the latest date (None = all history).
+RANGE_PRESETS = {"1M": 1, "3M": 3, "6M": 6, "YTD": "ytd", "1Y": 12, "2Y": 24, "5Y": 60, "All": None}
+DEFAULT_RANGE_PRESET = "1Y"
+MAX_POINTS_WITH_MARKERS = 130  # ~6 months of trading days
+
+
+def preset_window(preset, data_start, data_end):
+    """(start, end) dates for a RANGE_PRESETS key, clamped to the data's own range."""
+    months = RANGE_PRESETS[preset]
+    if months is None:
+        start = data_start
+    elif months == "ytd":
+        start = date(data_end.year, 1, 1)
+    else:
+        start = (pd.Timestamp(data_end) - pd.DateOffset(months=months)).date()
+    return max(start, data_start), data_end
+
+
 def _row_date(row):
     """row['finra_date'] may be a pandas Timestamp (rows from the df) or an ISO string (rows straight from db.py)."""
     d = row["finra_date"]
@@ -314,6 +332,45 @@ with tab1:
         ),
     )
 
+    # --- Chart date range: preset buttons above, slider below ---
+    # Filtering the dataframe (rather than zooming a Plotly rangeslider) keeps
+    # the y-axis autoscaled to whatever window is shown - with ~10 years of
+    # history, a 1M view would otherwise be squashed flat against the full
+    # history's y-range.
+    data_start = df["finra_date"].iloc[0].date()
+    data_end = df["finra_date"].iloc[-1].date()
+    if "chart_range_slider" not in st.session_state:
+        st.session_state["chart_range_preset"] = DEFAULT_RANGE_PRESET
+        st.session_state["chart_range_slider"] = preset_window(DEFAULT_RANGE_PRESET, data_start, data_end)
+
+    def _apply_range_preset():
+        preset = st.session_state.get("chart_range_preset")
+        if preset is not None:
+            st.session_state["chart_range_slider"] = preset_window(preset, data_start, data_end)
+
+    def _clear_range_preset():
+        st.session_state["chart_range_preset"] = None
+
+    st.segmented_control(
+        "Date range",
+        options=list(RANGE_PRESETS.keys()),
+        key="chart_range_preset",
+        on_change=_apply_range_preset,
+        label_visibility="collapsed",
+    )
+
+    # A slider value saved in an earlier session can fall outside today's data
+    # range (e.g. the db grew); clamp it rather than letting st.slider error.
+    window_start, window_end = st.session_state["chart_range_slider"]
+    window_start = min(max(window_start, data_start), data_end)
+    window_end = min(max(window_end, window_start), data_end)
+    st.session_state["chart_range_slider"] = (window_start, window_end)
+
+    chart_df = df[(df["finra_date"].dt.date >= window_start) & (df["finra_date"].dt.date <= window_end)]
+    # Diamond markers are readable for a few months of dailies; across years they
+    # turn into a solid smear, so drop to plain lines past that.
+    trace_mode = "lines+markers" if len(chart_df) <= MAX_POINTS_WITH_MARKERS else "lines"
+
     fig = go.Figure()
     series = [
         (f"spread_5yr_{suffix}", "Spread vs 5yr", COLOR_SPREAD_5YR),
@@ -323,9 +380,9 @@ with tab1:
     for col, name, color in series:
         fig.add_trace(
             go.Scatter(
-                x=df["finra_date"],
-                y=df[col],
-                mode="lines+markers",
+                x=chart_df["finra_date"],
+                y=chart_df[col],
+                mode=trace_mode,
                 name=name,
                 line=dict(color=color, width=2),
                 marker=dict(symbol="diamond-open", size=8, line=dict(width=1.5, color=color)),
@@ -346,14 +403,34 @@ with tab1:
 
     st.plotly_chart(fig, width="stretch")
 
+    st.slider(
+        "Chart period",
+        min_value=data_start,
+        max_value=data_end,
+        key="chart_range_slider",
+        on_change=_clear_range_preset,
+        format="MMM D, YYYY",
+        label_visibility="collapsed",
+    )
+
+    # Days inside a documented known gap (db.KNOWN_DATA_GAPS) are explained
+    # once below, not counted as unexpected missing days.
+    in_known_gap = df["finra_date"].dt.date.map(db.in_known_gap)
     if suffix == "normalized":
-        missing_count = int(df[f"par_coupon_{suffix}"].isna().sum())
+        missing_count = int((df[f"par_coupon_{suffix}"].isna() & ~in_known_gap).sum())
         if missing_count:
             st.caption(
                 f"Normalized par coupon isn't computable for {missing_count} historical day(s) "
                 "(missing/thin next-month data that day) - those show as gaps in the lines above, "
                 "not zeros or an error."
             )
+    visible_gaps = [
+        f"{gap_start:%b %d, %Y} - {gap_end:%b %d, %Y} ({reason})"
+        for gap_start, gap_end, reason in db.KNOWN_DATA_GAPS
+        if gap_start <= window_end and gap_end >= window_start
+    ]
+    if visible_gaps:
+        st.caption("Known gaps in the lines above: " + "; ".join(visible_gaps) + ".")
 
     with st.expander("Show underlying data"):
         curve_cols = ["coupon_curve_raw", "coupon_curve_normalized"]

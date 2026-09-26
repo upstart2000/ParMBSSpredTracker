@@ -1,15 +1,21 @@
 """
 Parses the FINRA-ICE Data Services Structured Product Pricing Tables (FINRA_IDS_PXTABLES.xlsx),
 TBA sheet, 30-Year UMBS AVERAGE PRICE rows, and computes the par coupon via linear interpolation.
+
+UMBS launched in June 2019. Before that the 30Y conventional row is labelled
+"FNMA" (Fannie Mae TBA, the conventional benchmark UMBS replaced), and around
+the changeover FINRA labelled it "FNMA/UMBS" - all three are treated as the
+same series (see SUB_CLASS_LABELS).
 """
 import openpyxl
 from datetime import date
 
 
 TARGET_TABLE_LABEL = "PRICING TABLE: AGENCY PASS-THRU (TBA, STIP, $ ROLLS) - SINGLE FAMILY 30Y"
-SUB_CLASS = "UMBS"
+SUB_CLASS_LABELS = {"UMBS", "FNMA/UMBS", "FNMA"}
 PRICE_METRIC_ROW = "AVERAGE PRICE"
 COUPON_STEP = 0.5
+MAX_EXTRAPOLATION = COUPON_STEP  # max coupon points par may be extrapolated past the quoted range
 DATA_AS_OF_LABEL = "DATA AS OF:"
 
 
@@ -74,7 +80,7 @@ def parse_tba_30y_umbs(filepath):
                 if isinstance(sub_class_cell, str) and sub_class_cell.strip() == TARGET_TABLE_LABEL:
                     break  # ran into next table
 
-                if isinstance(sub_class_cell, str) and sub_class_cell.strip() == SUB_CLASS:
+                if isinstance(sub_class_cell, str) and sub_class_cell.strip() in SUB_CLASS_LABELS:
                     # This row is the coupon header row for UMBS: columns C.. = coupon labels
                     coupon_headers = [ws.cell(row=r, column=c).value for c in range(3, 10)]
                     # Find the AVERAGE PRICE row a few rows below
@@ -114,9 +120,14 @@ def compute_par_coupon(coupon_prices):
     puts even the lowest-coupon bucket above 100 - there's no true bracket to
     interpolate within. Falls back to extrapolating along the same line using
     the two buckets nearest par on that side (the two highest coupons when all
-    are below par, the two lowest when all are above). Returns None only when
-    fewer than two usable buckets exist at all, or the two chosen buckets are
-    priced identically (degenerate, divide-by-zero).
+    are below par, the two lowest when all are above). The extrapolated par
+    coupon must land within MAX_EXTRAPOLATION coupon points past the quoted
+    range - further out the straight-line fit breaks down (in 2020, when par
+    sat well below FINRA's lowest quoted coupon, it produced par coupons like
+    -24%), so those days return None rather than a misleading value.
+    Returns None when fewer than two usable buckets exist, the two chosen
+    buckets are priced identically (degenerate, divide-by-zero), or the
+    extrapolation would exceed that limit.
     """
     if not coupon_prices or len(coupon_prices) < 2:
         return None
@@ -124,6 +135,7 @@ def compute_par_coupon(coupon_prices):
     coupons_sorted = sorted(coupon_prices.keys())
 
     c_low = p_low = c_high = p_high = None
+    extrapolating = None  # "below" (par under the lowest coupon) / "above" (over the highest)
     for c in coupons_sorted:
         p = coupon_prices[c]
         if p <= 100:
@@ -136,15 +148,25 @@ def compute_par_coupon(coupon_prices):
         # every bucket prices above par - extrapolate using the two lowest coupons
         c_low, c_high = coupons_sorted[0], coupons_sorted[1]
         p_low, p_high = coupon_prices[c_low], coupon_prices[c_high]
+        extrapolating = "below"
     elif c_high is None:
         # every bucket prices at/below par - extrapolate using the two highest coupons
         c_high, c_low = coupons_sorted[-1], coupons_sorted[-2]
         p_high, p_low = coupon_prices[c_high], coupon_prices[c_low]
+        extrapolating = "above"
 
     if p_high == p_low:
         return None  # degenerate, avoid divide-by-zero
 
     par_coupon = c_low + (100 - p_low) * (c_high - c_low) / (p_high - p_low)
+
+    # Also rejects a wrong-direction result (e.g. an inverted price pair sending
+    # an "all above par" extrapolation upward instead of below the lowest coupon).
+    if extrapolating == "below" and not (c_low - MAX_EXTRAPOLATION <= par_coupon <= c_low):
+        return None
+    if extrapolating == "above" and not (c_high <= par_coupon <= c_high + MAX_EXTRAPOLATION):
+        return None
+
     return round(par_coupon, 4), (c_low, p_low), (c_high, p_high)
 
 
