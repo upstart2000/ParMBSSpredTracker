@@ -78,6 +78,65 @@ def preset_window(preset, data_start, data_end):
     return max(start, data_start), data_end
 
 
+def range_preset_control(prefix, data_start, data_end):
+    """
+    Renders a chart's 1M..All preset buttons (keys "<prefix>_range_preset" /
+    "<prefix>_range_slider") and returns its current (start, end) window.
+    Pair with range_slider_control(prefix, ...) below the chart. Each prefix
+    keeps its own independent window.
+    """
+    preset_key, slider_key = f"{prefix}_range_preset", f"{prefix}_range_slider"
+    if slider_key not in st.session_state:
+        st.session_state[preset_key] = DEFAULT_RANGE_PRESET
+        st.session_state[slider_key] = preset_window(DEFAULT_RANGE_PRESET, data_start, data_end)
+
+    def _apply_preset():
+        preset = st.session_state.get(preset_key)
+        if preset is not None:
+            st.session_state[slider_key] = preset_window(preset, data_start, data_end)
+
+    st.segmented_control(
+        "Date range",
+        options=list(RANGE_PRESETS.keys()),
+        key=preset_key,
+        on_change=_apply_preset,
+        label_visibility="collapsed",
+    )
+
+    # A slider value saved in an earlier session can fall outside today's data
+    # range (e.g. the db grew); clamp it rather than letting st.slider error.
+    window_start, window_end = st.session_state[slider_key]
+    window_start = min(max(window_start, data_start), data_end)
+    window_end = min(max(window_end, window_start), data_end)
+    st.session_state[slider_key] = (window_start, window_end)
+    return window_start, window_end
+
+
+def range_slider_control(prefix, data_start, data_end):
+    """The date-range slider under a chart; dragging it clears that chart's preset button."""
+    def _clear_preset():
+        st.session_state[f"{prefix}_range_preset"] = None
+
+    st.slider(
+        "Chart period",
+        min_value=data_start,
+        max_value=data_end,
+        key=f"{prefix}_range_slider",
+        on_change=_clear_preset,
+        format="MMM D, YYYY",
+        label_visibility="collapsed",
+    )
+
+
+def window_rows(df, window_start, window_end):
+    """Rows of df within [window_start, window_end], plus the trace mode for that many points."""
+    rows = df[(df["finra_date"].dt.date >= window_start) & (df["finra_date"].dt.date <= window_end)]
+    # Diamond markers are readable for a few months of dailies; across years they
+    # turn into a solid smear, so drop to plain lines past that.
+    mode = "lines+markers" if len(rows) <= MAX_POINTS_WITH_MARKERS else "lines"
+    return rows, mode
+
+
 def _row_date(row):
     """row['finra_date'] may be a pandas Timestamp (rows from the df) or an ISO string (rows straight from db.py)."""
     d = row["finra_date"]
@@ -340,37 +399,8 @@ with tab1:
     # history's y-range.
     data_start = df["finra_date"].iloc[0].date()
     data_end = df["finra_date"].iloc[-1].date()
-    if "chart_range_slider" not in st.session_state:
-        st.session_state["chart_range_preset"] = DEFAULT_RANGE_PRESET
-        st.session_state["chart_range_slider"] = preset_window(DEFAULT_RANGE_PRESET, data_start, data_end)
-
-    def _apply_range_preset():
-        preset = st.session_state.get("chart_range_preset")
-        if preset is not None:
-            st.session_state["chart_range_slider"] = preset_window(preset, data_start, data_end)
-
-    def _clear_range_preset():
-        st.session_state["chart_range_preset"] = None
-
-    st.segmented_control(
-        "Date range",
-        options=list(RANGE_PRESETS.keys()),
-        key="chart_range_preset",
-        on_change=_apply_range_preset,
-        label_visibility="collapsed",
-    )
-
-    # A slider value saved in an earlier session can fall outside today's data
-    # range (e.g. the db grew); clamp it rather than letting st.slider error.
-    window_start, window_end = st.session_state["chart_range_slider"]
-    window_start = min(max(window_start, data_start), data_end)
-    window_end = min(max(window_end, window_start), data_end)
-    st.session_state["chart_range_slider"] = (window_start, window_end)
-
-    chart_df = df[(df["finra_date"].dt.date >= window_start) & (df["finra_date"].dt.date <= window_end)]
-    # Diamond markers are readable for a few months of dailies; across years they
-    # turn into a solid smear, so drop to plain lines past that.
-    trace_mode = "lines+markers" if len(chart_df) <= MAX_POINTS_WITH_MARKERS else "lines"
+    window_start, window_end = range_preset_control("chart", data_start, data_end)
+    chart_df, trace_mode = window_rows(df, window_start, window_end)
 
     fig = go.Figure()
     series = [
@@ -404,15 +434,7 @@ with tab1:
 
     st.plotly_chart(fig, width="stretch")
 
-    st.slider(
-        "Chart period",
-        min_value=data_start,
-        max_value=data_end,
-        key="chart_range_slider",
-        on_change=_clear_range_preset,
-        format="MMM D, YYYY",
-        label_visibility="collapsed",
-    )
+    range_slider_control("chart", data_start, data_end)
 
     # Days inside a documented known gap (db.KNOWN_DATA_GAPS) are explained
     # once below, not counted as unexpected missing days.
@@ -434,8 +456,10 @@ with tab1:
         st.caption("Known gaps in the lines above: " + "; ".join(visible_gaps) + ".")
 
     # --- Spread vs 10yr with the 10yr UST on a secondary y-axis ---
-    # Same window as the chart above.
+    # Has its own range presets/slider, independent of the chart above.
     st.subheader("Spread vs 10yr and the 10yr UST")
+    rates_start, rates_end = range_preset_control("rates_chart", data_start, data_end)
+    rates_df, rates_mode = window_rows(df, rates_start, rates_end)
     rates_fig = go.Figure()
     for y_col, name, color, yaxis in [
         (f"spread_10yr_{suffix}", "Spread vs 10yr (bps)", COLOR_SPREAD_10YR, "y"),
@@ -443,9 +467,9 @@ with tab1:
     ]:
         rates_fig.add_trace(
             go.Scatter(
-                x=chart_df["finra_date"],
-                y=chart_df[y_col],
-                mode=trace_mode,
+                x=rates_df["finra_date"],
+                y=rates_df[y_col],
+                mode=rates_mode,
                 name=name,
                 yaxis=yaxis,
                 line=dict(color=color, width=2),
@@ -466,6 +490,7 @@ with tab1:
     )
     rates_fig.update_xaxes(showgrid=True, gridcolor=GRIDLINE, zeroline=False)
     st.plotly_chart(rates_fig, width="stretch")
+    range_slider_control("rates_chart", data_start, data_end)
 
     with st.expander("Show underlying data"):
         curve_cols = ["coupon_curve_raw", "coupon_curve_normalized"]
