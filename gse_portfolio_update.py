@@ -45,6 +45,13 @@ MONTH_ABBR = list(calendar.month_abbr)[1:]    # 'Jan' .. 'Dec'
 # (wrong column, shifted row) slip through as "valid".
 COMPONENT_SUM_TOLERANCE = 3
 
+# Freddie Mac's Monthly Volume Summary comes at different page sizes from
+# month to month - standard letter landscape (792pt wide; e.g. Dec 2025,
+# Mar-May 2026, Aug 2026) or oversized (~2933-3046pt; e.g. Jan-Feb, Jun-Jul
+# 2026) - with the same layout scaled. parse_fhlmc_table3's position offsets
+# were measured on a 2933.33pt page and are scaled by page width / this.
+FHLMC_REFERENCE_PAGE_WIDTH = 2933.33
+
 
 def next_target_month(csv_path=CSV_PATH):
     """(year, month) for the next month to fetch - one past whatever's latest in the CSV."""
@@ -101,7 +108,7 @@ def _parse_number(text):
     return -value if negative else value
 
 
-def _find_column_bounds(header_words, label_to_x0):
+def _find_column_bounds(header_words, label_to_x0, scale=1.0):
     """
     Given words on a page and {header_label: x0_of_that_header_word}, returns
     {header_label: (x0_lo, x0_hi)} - each column's range spans from just left
@@ -109,13 +116,15 @@ def _find_column_bounds(header_words, label_to_x0):
     the rightmost), so a value column catches split digit-group fragments
     that land a few points left/right of the header word itself (observed in
     Freddie Mac's PDF: some rows render a cell's leading digit as a separate
-    text run from the rest, e.g. "3" + "0,630" for "30,630").
+    text run from the rest, e.g. "3" + "0,630" for "30,630"). scale shrinks
+    the 40pt margin for PDFs rendered at a smaller page size (see
+    FHLMC_REFERENCE_PAGE_WIDTH).
     """
     ordered = sorted(label_to_x0.items(), key=lambda kv: kv[1])
     bounds = {}
     for i, (label, x0) in enumerate(ordered):
-        lo = x0 - 40
-        hi = ordered[i + 1][1] - 40 if i + 1 < len(ordered) else x0 + 999
+        lo = x0 - 40 * scale
+        hi = ordered[i + 1][1] - 40 * scale if i + 1 < len(ordered) else x0 + 999
         bounds[label] = (lo, hi)
     return bounds
 
@@ -195,15 +204,25 @@ def parse_fhlmc_table3(pdf_bytes, target_year, target_month):
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             words = page.extract_words()
-            heading3 = [w for w in words if w["text"] == "3" and w["top"] < 1200 and w["x0"] > 1200]
+            # The offsets below were measured on the older, oversized page
+            # (FHLMC_REFERENCE_PAGE_WIDTH); scale them to this page's width.
+            scale = page.width / FHLMC_REFERENCE_PAGE_WIDTH
+            # "TABLE 3" heading - require the "TABLE" word just left of the "3", since
+            # split digit runs in other tables (e.g. "3" + "0,630") also yield bare "3"s.
+            table_words = [w for w in words if w["text"] == "TABLE"]
+            heading3 = [
+                w for w in words
+                if w["text"] == "3" and w["top"] < 1200 * scale and w["x0"] > 1200 * scale
+                and any(abs(t["top"] - w["top"]) < 2 * scale and 0 <= w["x0"] - t["x1"] < 20 * scale for t in table_words)
+            ]
             if not heading3:
                 continue
             # -70: see the matching comment in parse_fnma_table4 - Table 2 (to Table 3's
             # left) tops out ~83pt left of the "TABLE 3" heading, and Table 3's own
             # month-label column starts ~58pt left of it; -70 sits in that gap.
-            right = [w for w in words if w["x0"] > heading3[0]["x0"] - 70]
+            right = [w for w in words if w["x0"] > heading3[0]["x0"] - 70 * scale]
 
-            header_top_range = (heading3[0]["top"] + 40, heading3[0]["top"] + 130)
+            header_top_range = (heading3[0]["top"] + 40 * scale, heading3[0]["top"] + 130 * scale)
             agency_x0 = _header_x0(right, {"Agency"}, header_top_range)
             nonagency_x0 = _header_x0(right, {"Non-Agency"}, header_top_range)
             loans_x0 = _header_x0(right, {"Loans"}, header_top_range)
@@ -214,8 +233,9 @@ def parse_fhlmc_table3(pdf_bytes, target_year, target_month):
             bounds = _find_column_bounds(
                 right,
                 {"agency": agency_x0, "non_agency": nonagency_x0, "loans": loans_x0, "balance": balance_x0},
+                scale=scale,
             )
-            label_hi = agency_x0 - 40
+            label_hi = agency_x0 - 40 * scale
 
             # Freddie Mac's table only spells out the year on each calendar year's
             # first row ("Jul 2025", then bare "Aug", "Sep", ... "Dec", then "Jan
@@ -238,6 +258,8 @@ def parse_fhlmc_table3(pdf_bytes, target_year, target_month):
                 non_agency = _parse_number(_cell_text(row_words, *bounds["non_agency"]))
                 loans = _parse_number(_cell_text(row_words, *bounds["loans"]))
                 balance = _parse_number(_cell_text(row_words, *bounds["balance"]))
+                if (agency, non_agency, loans, balance) == (None, None, None, None):
+                    continue  # a bare "May 2026"-style title line, not the data row
                 if None in (agency, non_agency, loans, balance):
                     logger.warning("FHLMC %s: found row but couldn't parse all 4 numbers: %r", target_label, row_words)
                     return None
