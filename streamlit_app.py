@@ -492,6 +492,50 @@ with tab1:
     st.plotly_chart(rates_fig, width="stretch")
     range_slider_control("rates_chart", data_start, data_end)
 
+    # --- Same two series as two stacked panels on one shared date axis ---
+    # Both traces sit on the single x-axis "x" with y-axes stacked in separate
+    # vertical domains - Plotly's hoversubplots="axis" only spans panels that
+    # share the same x-axis object. Own range presets/slider.
+    st.subheader("Spread vs 10yr and the 10yr UST (stacked panels)")
+    panels_start, panels_end = range_preset_control("panels_chart", data_start, data_end)
+    panels_df, panels_mode = window_rows(df, panels_start, panels_end)
+    panels_fig = go.Figure()
+    for y_col, name, color, yaxis in [
+        (f"spread_10yr_{suffix}", "Spread vs 10yr (bps)", COLOR_SPREAD_10YR, "y"),
+        ("ust_10yr", "10yr UST (%)", COLOR_UST_10YR, "y2"),
+    ]:
+        panels_fig.add_trace(
+            go.Scatter(
+                x=panels_df["finra_date"],
+                y=panels_df[y_col],
+                mode=panels_mode,
+                name=name,
+                yaxis=yaxis,
+                line=dict(color=color, width=2),
+                marker=dict(symbol="diamond-open", size=8, line=dict(width=1.5, color=color)),
+            )
+        )
+    panel_axis = dict(showgrid=True, gridcolor=GRIDLINE, zeroline=False)
+    panels_fig.update_layout(
+        height=560,
+        hovermode="x unified",
+        hoversubplots="axis",  # one hover line/tooltip spanning both panels
+        hoverlabel=dict(namelength=-1),
+        showlegend=False,       # each panel is named by its own y-axis title
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(t=20, b=40),
+        # anchor="y2": draw the shared date axis under the bottom panel.
+        xaxis=dict(
+            title_text="Date", anchor="y2", hoverformat="%b %d, %Y",
+            showgrid=True, gridcolor=GRIDLINE, zeroline=False,
+        ),
+        yaxis=dict(title_text="Spread vs 10yr (bps)", domain=[0.53, 1.0], **panel_axis),
+        yaxis2=dict(title_text="10yr UST (%)", domain=[0.0, 0.47], anchor="x", **panel_axis),
+    )
+    st.plotly_chart(panels_fig, width="stretch")
+    range_slider_control("panels_chart", data_start, data_end)
+
     with st.expander("Show underlying data"):
         curve_cols = ["coupon_curve_raw", "coupon_curve_normalized"]
         st.dataframe(df.drop(columns=curve_cols), width="stretch")
