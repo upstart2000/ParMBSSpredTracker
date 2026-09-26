@@ -23,6 +23,7 @@ import db
 COLOR_SPREAD_5YR = "#2a78d6"   # blue
 COLOR_SPREAD_10YR = "#1baf7a"  # aqua
 COLOR_SPREAD_AVG = "#eda100"   # yellow
+COLOR_UST_10YR = "#eb6834"     # orange (next unused categorical slot)
 COLOR_UP = "#006300"
 COLOR_DOWN = "#e34948"
 GRIDLINE = "#e1e0d9"
@@ -431,6 +432,40 @@ with tab1:
     ]
     if visible_gaps:
         st.caption("Known gaps in the lines above: " + "; ".join(visible_gaps) + ".")
+
+    # --- Spread vs 10yr with the 10yr UST on a secondary y-axis ---
+    # Same window as the chart above.
+    st.subheader("Spread vs 10yr and the 10yr UST")
+    rates_fig = go.Figure()
+    for y_col, name, color, yaxis in [
+        (f"spread_10yr_{suffix}", "Spread vs 10yr (bps)", COLOR_SPREAD_10YR, "y"),
+        ("ust_10yr", "10yr UST (%)", COLOR_UST_10YR, "y2"),
+    ]:
+        rates_fig.add_trace(
+            go.Scatter(
+                x=chart_df["finra_date"],
+                y=chart_df[y_col],
+                mode=trace_mode,
+                name=name,
+                yaxis=yaxis,
+                line=dict(color=color, width=2),
+                marker=dict(symbol="diamond-open", size=8, line=dict(width=1.5, color=color)),
+            )
+        )
+    rates_fig.update_layout(
+        xaxis_title="Date",
+        xaxis_hoverformat="%b %d, %Y",
+        yaxis=dict(title_text="Spread vs 10yr (bps)", showgrid=True, gridcolor=GRIDLINE, zeroline=False),
+        yaxis2=dict(title_text="10yr UST (%)", overlaying="y", side="right", showgrid=False, zeroline=False),
+        hovermode="x unified",
+        hoverlabel=dict(namelength=-1),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(t=60, b=40),
+    )
+    rates_fig.update_xaxes(showgrid=True, gridcolor=GRIDLINE, zeroline=False)
+    st.plotly_chart(rates_fig, width="stretch")
 
     with st.expander("Show underlying data"):
         curve_cols = ["coupon_curve_raw", "coupon_curve_normalized"]
