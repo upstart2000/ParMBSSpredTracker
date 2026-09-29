@@ -315,6 +315,7 @@ def gse_portfolio_chart(wide_df, yaxis_title):
 
 
 QUARTER_LABEL_COL = "Quarter"
+QUARTERLY_SORT_CHRONOLOGICAL = "Quarter (chronological)"
 # (metric key, level unit) - key doubles as the level column's own name, matching
 # the daily table's column names exactly ("UST 5yr" etc. have no unit suffix
 # there either; SPREAD_COLUMNS already embeds "(bps)"). Delta columns are always
@@ -675,7 +676,27 @@ with tab2:
     if quarterly_table.empty:
         st.info("Not enough completed quarters yet to show quarterly changes.")
     else:
-        st.markdown(quarterly_table_html(quarterly_table), unsafe_allow_html=True)
+        sort_cols = st.columns([3, 1])
+        with sort_cols[0]:
+            sort_choice = st.selectbox(
+                "Sort by",
+                options=[QUARTERLY_SORT_CHRONOLOGICAL] + [c for c in quarterly_table.columns if c != QUARTER_LABEL_COL],
+                key="quarterly_sort_col",
+                help="E.g. pick a Δ column and sort descending to find the largest quarter-over-quarter moves.",
+            )
+        with sort_cols[1]:
+            sort_desc = st.checkbox("Descending", key="quarterly_sort_desc")
+
+        if sort_choice == QUARTERLY_SORT_CHRONOLOGICAL:
+            # Already built in chronological order; reverse it for descending
+            # rather than sort_values, since the "Quarter" column is display
+            # text ("Q4 2017") that doesn't sort correctly as a string across
+            # different quarter numbers and years.
+            display_table = quarterly_table.iloc[::-1] if sort_desc else quarterly_table
+        else:
+            display_table = quarterly_table.sort_values(sort_choice, ascending=not sort_desc, na_position="last")
+
+        st.markdown(quarterly_table_html(display_table), unsafe_allow_html=True)
         if quarterly_table["Quarter"].str.endswith("†").any():
             gap_notes = "; ".join(
                 f"{gap_start:%b %Y}-{gap_end:%b %Y} ({reason})" for gap_start, gap_end, reason in db.KNOWN_DATA_GAPS
