@@ -314,14 +314,19 @@ def gse_portfolio_chart(wide_df, yaxis_title):
     return fig
 
 
-QUARTERLY_METRICS = [
-    ("UST 5yr", "%"),
-    ("UST 10yr", "%"),
-    ("Par Coupon", "%"),
-    ("Spread vs 5yr (bps)", "bps"),
-    ("Spread vs 10yr (bps)", "bps"),
-    ("Spread vs 5/10yr (bps)", "bps"),
+QUARTER_LABEL_COL = "Quarter"
+QUARTERLY_SORT_CHRONOLOGICAL = "Quarter (chronological)"
+# (metric key, level unit) - key doubles as the level column's own name, matching
+# the daily table's column names exactly ("UST 5yr" etc. have no unit suffix
+# there either; SPREAD_COLUMNS already embeds "(bps)"). Delta columns are always
+# bps (see build_quarterly_changes_table), so they don't repeat the unit either.
+QUARTERLY_METRICS = [("UST 5yr", "%"), ("UST 10yr", "%"), ("Par Coupon", "%")] + [
+    (c, "bps") for c in SPREAD_COLUMNS
 ]
+
+
+def _delta_col_name(key):
+    return f"{key.replace(' (bps)', '')} Δ"
 
 
 def build_quarterly_changes_table(df, suffix):
@@ -333,6 +338,10 @@ def build_quarterly_changes_table(df, suffix):
     containing df's most recent row is excluded - it isn't "complete" yet,
     same convention db.get_quarter_end_rows() uses for the two-quarter view
     on the main tab (which this generalizes to the full history).
+
+    A quarter-end date that falls inside db.KNOWN_DATA_GAPS gets a "†"
+    marker appended to its label (see the caption built alongside this
+    table for what that means).
     """
     if df.empty:
         return pd.DataFrame()
@@ -344,34 +353,48 @@ def build_quarterly_changes_table(df, suffix):
     if quarter_ends.empty:
         return pd.DataFrame()
 
-    level_col = {key: f"{key.replace(' (bps)', '')} ({unit})" for key, unit in QUARTERLY_METRICS}
-    delta_col = {key: f"{key.replace(' (bps)', '')} Δ (bps)" for key, _ in QUARTERLY_METRICS}
-
-    rows = {}
+    records = []
     prev_vals = None
     for row in quarter_ends.to_dict("records"):
         vals = snapshot_row_values(row, suffix, coupon_union=[])
-        label = f"{_quarter_label(_row_date(row))} ({_row_date(row)})"
-        out_row = {}
+        row_date = _row_date(row)
+        label = _quarter_label(row_date)
+        if db.in_known_gap(row_date):
+            label += " †"
+        out_row = {QUARTER_LABEL_COL: label}
         for key, unit in QUARTERLY_METRICS:
             level = vals.get(key)
-            out_row[level_col[key]] = level
+            out_row[key] = level
             prev = prev_vals.get(key) if prev_vals is not None else None
             if level is None or pd.isna(level) or prev is None or pd.isna(prev):
-                out_row[delta_col[key]] = None
+                out_row[_delta_col_name(key)] = None
             else:
                 diff = (level - prev) * 100 if unit == "%" else (level - prev)
-                out_row[delta_col[key]] = round(diff, 1)
-        rows[label] = out_row
+                out_row[_delta_col_name(key)] = round(diff, 1)
+        records.append(out_row)
         prev_vals = vals
 
-    ordered_cols = [c for key, _ in QUARTERLY_METRICS for c in (level_col[key], delta_col[key])]
-    return pd.DataFrame.from_dict(rows, orient="index", columns=ordered_cols)
+    ordered_cols = [QUARTER_LABEL_COL] + [c for key, _ in QUARTERLY_METRICS for c in (key, _delta_col_name(key))]
+    return pd.DataFrame(records, columns=ordered_cols)
 
 
-def style_quarterly_table(table_df):
-    delta_cols = [c for c in table_df.columns if c.endswith("Δ (bps)")]
-    level_cols = [c for c in table_df.columns if c not in delta_cols]
+def quarterly_table_html(table_df):
+    """
+    Renders as a plain HTML table (via Styler.to_html(), not st.dataframe)
+    because st.dataframe's grid enforces a ~98px minimum column width that
+    ignores a smaller column_config width entirely - with 13 columns, that
+    floor alone exceeds a normal page width and forces a horizontal
+    scrollbar no matter how narrow each column is configured. A plain table
+    has no such floor: long headers wrap onto a second line instead
+    (white-space: normal), and 13 narrow columns comfortably fit one width.
+    Trade-off: loses st.dataframe's native click-header-to-sort.
+    """
+    delta_cols = [c for c in table_df.columns if c.endswith(" Δ")]
+    # Same convention as style_daily_table: spread columns (already bps) get 0
+    # decimals, UST/Par Coupon (percent) get 2 - and since every delta is bps
+    # by construction here, deltas get 0 decimals across the board too.
+    spread_level_cols = [c for c in table_df.columns if c in SPREAD_COLUMNS]
+    pct_level_cols = [c for c in table_df.columns if c in ("UST 5yr", "UST 10yr", "Par Coupon")]
 
     def color_deltas(col):
         styles = []
@@ -386,15 +409,29 @@ def style_quarterly_table(table_df):
                 styles.append("")
         return styles
 
-    return (
+    styler = (
         table_df.style
-        .format(precision=2, na_rep="—", subset=level_cols)
-        .format(precision=1, na_rep="—", subset=delta_cols)
+        .format(precision=2, na_rep="—", subset=pct_level_cols)
+        .format(precision=0, na_rep="—", subset=spread_level_cols)
+        .format(precision=0, na_rep="—", subset=delta_cols)
         .apply(color_deltas, subset=delta_cols, axis=0)
+        .hide(axis="index")
+        .set_table_styles(
+            [
+                {"selector": "table", "props": "width:100%; table-layout:fixed; border-collapse:collapse; font-size:12.5px;"},
+                {"selector": "th", "props": (
+                    "white-space:normal; word-break:break-word; text-align:right; vertical-align:bottom; "
+                    f"padding:4px 5px; line-height:1.15; border-bottom:1px solid {GRIDLINE}; font-weight:600;"
+                )},
+                {"selector": "td", "props": f"text-align:right; padding:3px 5px; border-bottom:1px solid {GRIDLINE};"},
+                {"selector": "th.col0, td.col0", "props": "text-align:left; width:9%;"},
+            ]
+        )
     )
+    return styler.to_html()
 
 
-tab1, tab2, tab3 = st.tabs(["MBS Spread Tracker", "GSE Retained Portfolios", "Quarterly Changes"])
+tab1, tab2, tab3 = st.tabs(["MBS Spread Tracker", "Quarterly Changes", "GSE Retained Portfolios"])
 
 with tab1:
     st.title("MBS Spread Tracker")
@@ -625,6 +662,48 @@ with tab1:
         st.warning(gap_warning)
 
 with tab2:
+    st.title("Quarterly Changes")
+    st.caption(
+        "Every completed calendar quarter's close, with the change from the prior quarter-end "
+        "alongside it - all changes in bps, so a UST move and a spread move sit on the same scale "
+        "and are directly comparable. Same comparison as the 'Prior Quarter Change' row on the MBS "
+        f"Spread Tracker tab's daily table, extended across the full dataset ({data_start:%b %Y} "
+        "onward) instead of just the two most recent quarters. Uses whichever Raw/Normalized series "
+        "is selected there."
+    )
+
+    quarterly_table = build_quarterly_changes_table(df, suffix)
+    if quarterly_table.empty:
+        st.info("Not enough completed quarters yet to show quarterly changes.")
+    else:
+        sort_cols = st.columns([3, 1])
+        with sort_cols[0]:
+            sort_choice = st.selectbox(
+                "Sort by",
+                options=[QUARTERLY_SORT_CHRONOLOGICAL] + [c for c in quarterly_table.columns if c != QUARTER_LABEL_COL],
+                key="quarterly_sort_col",
+                help="E.g. pick a Δ column and sort descending to find the largest quarter-over-quarter moves.",
+            )
+        with sort_cols[1]:
+            sort_desc = st.checkbox("Descending", key="quarterly_sort_desc")
+
+        if sort_choice == QUARTERLY_SORT_CHRONOLOGICAL:
+            # Already built in chronological order; reverse it for descending
+            # rather than sort_values, since the "Quarter" column is display
+            # text ("Q4 2017") that doesn't sort correctly as a string across
+            # different quarter numbers and years.
+            display_table = quarterly_table.iloc[::-1] if sort_desc else quarterly_table
+        else:
+            display_table = quarterly_table.sort_values(sort_choice, ascending=not sort_desc, na_position="last")
+
+        st.markdown(quarterly_table_html(display_table), unsafe_allow_html=True)
+        if quarterly_table["Quarter"].str.endswith("†").any():
+            gap_notes = "; ".join(
+                f"{gap_start:%b %Y}-{gap_end:%b %Y} ({reason})" for gap_start, gap_end, reason in db.KNOWN_DATA_GAPS
+            )
+            st.caption(f"† quarter-end falls inside a known FINRA data gap: {gap_notes}.")
+
+with tab3:
     st.title("GSE Retained Portfolios")
     st.caption(
         "Monthly retained/mortgage-related-investments portfolio composition for Fannie Mae and "
@@ -661,21 +740,3 @@ with tab2:
             display_df["month"] = display_df["month"].dt.strftime("%Y-%m")
             display_df["issuer"] = display_df["issuer"].map(ISSUER_LABELS).fillna(display_df["issuer"])
             st.dataframe(display_df, width="stretch")
-
-with tab3:
-    st.title("Quarterly Changes")
-    st.caption(
-        "Every completed calendar quarter's close, with the change from the prior quarter-end "
-        "alongside it - all changes in bps, so a UST move and a spread move sit on the same scale "
-        "and are directly comparable. Same comparison as the 'Prior Quarter Change' row on the MBS "
-        f"Spread Tracker tab's daily table, extended across the full dataset ({data_start:%b %Y} "
-        "onward) instead of just the two most recent quarters. Uses whichever Raw/Normalized series "
-        "is selected there. Click a column header to sort - e.g. to scan for the largest "
-        "quarter-over-quarter moves."
-    )
-
-    quarterly_table = build_quarterly_changes_table(df, suffix)
-    if quarterly_table.empty:
-        st.info("Not enough completed quarters yet to show quarterly changes.")
-    else:
-        st.dataframe(style_quarterly_table(quarterly_table), width="stretch")
