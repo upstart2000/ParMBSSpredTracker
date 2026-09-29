@@ -314,7 +314,87 @@ def gse_portfolio_chart(wide_df, yaxis_title):
     return fig
 
 
-tab1, tab2 = st.tabs(["MBS Spread Tracker", "GSE Retained Portfolios"])
+QUARTERLY_METRICS = [
+    ("UST 5yr", "%"),
+    ("UST 10yr", "%"),
+    ("Par Coupon", "%"),
+    ("Spread vs 5yr (bps)", "bps"),
+    ("Spread vs 10yr (bps)", "bps"),
+    ("Spread vs 5/10yr (bps)", "bps"),
+]
+
+
+def build_quarterly_changes_table(df, suffix):
+    """
+    One row per COMPLETED calendar quarter in df (the last trading day's row
+    within that quarter), with each metric's quarter-end level plus its
+    change from the prior quarter-end (always in bps, so a 0.27-point UST
+    move and a 27-bps spread move both just read as "27"). The quarter
+    containing df's most recent row is excluded - it isn't "complete" yet,
+    same convention db.get_quarter_end_rows() uses for the two-quarter view
+    on the main tab (which this generalizes to the full history).
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    d = df.copy()
+    d["_q"] = d["finra_date"].dt.to_period("Q")
+    quarter_ends = d.sort_values("finra_date").groupby("_q").tail(1).sort_values("finra_date")
+    quarter_ends = quarter_ends.iloc[:-1]  # drop the in-progress quarter
+    if quarter_ends.empty:
+        return pd.DataFrame()
+
+    level_col = {key: f"{key.replace(' (bps)', '')} ({unit})" for key, unit in QUARTERLY_METRICS}
+    delta_col = {key: f"{key.replace(' (bps)', '')} Δ (bps)" for key, _ in QUARTERLY_METRICS}
+
+    rows = {}
+    prev_vals = None
+    for row in quarter_ends.to_dict("records"):
+        vals = snapshot_row_values(row, suffix, coupon_union=[])
+        label = f"{_quarter_label(_row_date(row))} ({_row_date(row)})"
+        out_row = {}
+        for key, unit in QUARTERLY_METRICS:
+            level = vals.get(key)
+            out_row[level_col[key]] = level
+            prev = prev_vals.get(key) if prev_vals is not None else None
+            if level is None or pd.isna(level) or prev is None or pd.isna(prev):
+                out_row[delta_col[key]] = None
+            else:
+                diff = (level - prev) * 100 if unit == "%" else (level - prev)
+                out_row[delta_col[key]] = round(diff, 1)
+        rows[label] = out_row
+        prev_vals = vals
+
+    ordered_cols = [c for key, _ in QUARTERLY_METRICS for c in (level_col[key], delta_col[key])]
+    return pd.DataFrame.from_dict(rows, orient="index", columns=ordered_cols)
+
+
+def style_quarterly_table(table_df):
+    delta_cols = [c for c in table_df.columns if c.endswith("Δ (bps)")]
+    level_cols = [c for c in table_df.columns if c not in delta_cols]
+
+    def color_deltas(col):
+        styles = []
+        for v in col:
+            if pd.isna(v):
+                styles.append("")
+            elif v > 0:
+                styles.append(f"color:{COLOR_UP}; font-weight:600")
+            elif v < 0:
+                styles.append(f"color:{COLOR_DOWN}; font-weight:600")
+            else:
+                styles.append("")
+        return styles
+
+    return (
+        table_df.style
+        .format(precision=2, na_rep="—", subset=level_cols)
+        .format(precision=1, na_rep="—", subset=delta_cols)
+        .apply(color_deltas, subset=delta_cols, axis=0)
+    )
+
+
+tab1, tab2, tab3 = st.tabs(["MBS Spread Tracker", "GSE Retained Portfolios", "Quarterly Changes"])
 
 with tab1:
     st.title("MBS Spread Tracker")
@@ -581,3 +661,21 @@ with tab2:
             display_df["month"] = display_df["month"].dt.strftime("%Y-%m")
             display_df["issuer"] = display_df["issuer"].map(ISSUER_LABELS).fillna(display_df["issuer"])
             st.dataframe(display_df, width="stretch")
+
+with tab3:
+    st.title("Quarterly Changes")
+    st.caption(
+        "Every completed calendar quarter's close, with the change from the prior quarter-end "
+        "alongside it - all changes in bps, so a UST move and a spread move sit on the same scale "
+        "and are directly comparable. Same comparison as the 'Prior Quarter Change' row on the MBS "
+        f"Spread Tracker tab's daily table, extended across the full dataset ({data_start:%b %Y} "
+        "onward) instead of just the two most recent quarters. Uses whichever Raw/Normalized series "
+        "is selected there. Click a column header to sort - e.g. to scan for the largest "
+        "quarter-over-quarter moves."
+    )
+
+    quarterly_table = build_quarterly_changes_table(df, suffix)
+    if quarterly_table.empty:
+        st.info("Not enough completed quarters yet to show quarterly changes.")
+    else:
+        st.dataframe(style_quarterly_table(quarterly_table), width="stretch")
