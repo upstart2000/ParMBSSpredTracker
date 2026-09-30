@@ -153,6 +153,30 @@ def get_qtd_reference_row(finra_date, db_path=DEFAULT_DB_PATH):
         return dict(row) if row else None
 
 
+def get_prior_friday_row(latest_date, db_path=DEFAULT_DB_PATH):
+    """
+    The most recent row dated strictly before latest_date whose finra_date
+    is a Friday - i.e. last week's closing snapshot for a week-over-week
+    comparison. Always looks strictly backward (finra_date < latest_date),
+    so a Friday latest_date resolves to the PRIOR week's Friday (a full
+    week apart) rather than comparing a date to itself; any other weekday
+    resolves to the preceding week's Friday too, since the most recent
+    Friday before e.g. a Tuesday is still last week's. Returns None if no
+    such row exists yet (e.g. the very start of the dataset, before any
+    Friday has been ingested).
+    """
+    if isinstance(latest_date, str):
+        latest_date = date.fromisoformat(latest_date)
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            "SELECT * FROM daily_spreads WHERE finra_date < ? AND strftime('%w', finra_date) = '5' "
+            "ORDER BY finra_date DESC LIMIT 1",
+            (latest_date.isoformat(),),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
 def get_quarter_end_rows(latest_date, db_path=DEFAULT_DB_PATH):
     """
     Resolves the current and prior quarter-end snapshot rows relative to
