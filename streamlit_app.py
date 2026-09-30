@@ -54,7 +54,7 @@ SERIES_OPTIONS = {
 
 
 SPREAD_COLUMNS = ["Spread vs 5yr (bps)", "Spread vs 10yr (bps)", "Spread vs 5/10yr (bps)"]
-COMPUTED_ROW_LABELS = {"Daily Change", "Prior Quarter Change", "QTD Change"}
+COMPUTED_ROW_LABELS = {"Daily Change", "Weekly Change", "Prior Quarter Change", "QTD Change"}
 
 GSE_PORTFOLIO_CSV = "gse_retained_portfolio.csv"
 ISSUER_LABELS = {"FNMA": "Fannie Mae", "FHLMC": "Freddie Mac"}
@@ -187,20 +187,22 @@ def diff_row(values_a, values_b, columns, scope_columns=None):
     return result
 
 
-def build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix):
+def build_daily_table(today_row, prior_row, current_qe, prior_qe, friday_row, suffix):
     """
     Rows, in order: prior quarter-end, current quarter-end, Prior Quarter
     Change (current QE - prior QE), the two most recent stored trading days
-    (labeled with their actual dates), Daily Change (latest - prior), QTD
-    Change (latest - current QE). Any row whose source data isn't available
-    yet (e.g. no quarter-end baseline this early in the dataset) is omitted
-    rather than shown empty.
+    (labeled with their actual dates), Daily Change (latest - prior), Weekly
+    Change (latest - last Friday's close), QTD Change (latest - current QE).
+    Any row whose source data isn't available yet (e.g. no quarter-end
+    baseline this early in the dataset, or the dataset doesn't go back to a
+    prior Friday) is omitted rather than shown empty.
     """
     coupon_union = sorted(
         bracket_coupons(today_row, suffix)
         | bracket_coupons(prior_row, suffix)
         | bracket_coupons(current_qe, suffix)
         | bracket_coupons(prior_qe, suffix)
+        | bracket_coupons(friday_row, suffix)
     )
     columns = (
         ["UST 5yr", "UST 10yr"]
@@ -212,6 +214,7 @@ def build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix):
     prior_vals = snapshot_row_values(prior_row, suffix, coupon_union)
     current_qe_vals = snapshot_row_values(current_qe, suffix, coupon_union)
     prior_qe_vals = snapshot_row_values(prior_qe, suffix, coupon_union)
+    friday_vals = snapshot_row_values(friday_row, suffix, coupon_union)
 
     rows = {}
     if prior_qe_vals is not None:
@@ -225,6 +228,8 @@ def build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix):
     rows[_row_date(today_row).isoformat()] = today_vals
     if prior_vals is not None:
         rows["Daily Change"] = diff_row(today_vals, prior_vals, columns)
+    if friday_vals is not None:
+        rows["Weekly Change"] = diff_row(today_vals, friday_vals, columns)
     if current_qe_vals is not None:
         rows["QTD Change"] = diff_row(today_vals, current_qe_vals, columns)
 
@@ -488,7 +493,8 @@ with tab1:
 
     # --- Daily table ---
     current_qe, prior_qe = db.get_quarter_end_rows(today_row["finra_date"].date())
-    daily_table = build_daily_table(today_row, prior_row, current_qe, prior_qe, suffix)
+    friday_row = db.get_prior_friday_row(today_row["finra_date"].date())
+    daily_table = build_daily_table(today_row, prior_row, current_qe, prior_qe, friday_row, suffix)
     st.dataframe(style_daily_table(daily_table), width="stretch")
 
     st.divider()
