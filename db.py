@@ -250,6 +250,83 @@ def compute_qtd_fields(record, db_path=DEFAULT_DB_PATH):
     }
 
 
+# Quarter-end rows whose UST yields and par coupon are replaced with the
+# figures AGNC reported, so QTD changes are measured from the same baseline
+# AGNC uses. Our own sources differ on these days: Treasury.gov yields are a
+# ~3:30 PM ET snapshot, and FINRA prices are whole-day trade averages, while
+# AGNC uses end-of-day marks and a model-based "current coupon" yield.
+# par_coupon is AGNC's "30 Yr Agency CC" and is applied to both the raw and
+# normalized series. Coupon curves/brackets on these rows stay FINRA's.
+MANUAL_OVERRIDES = {
+    "2026-06-30": {"ust_5yr": 4.23, "ust_10yr": 4.47, "par_coupon": 5.41},
+    "2026-09-30": {"ust_5yr": 5.09, "ust_10yr": 5.29, "par_coupon": 6.44},
+}
+MANUAL_OVERRIDE_SOURCE = "AGNC Q3 2026 earnings presentation"
+
+
+def apply_manual_override(record):
+    """
+    If record's finra_date is in MANUAL_OVERRIDES, replaces its UST yields and
+    par coupons with the override values, recomputes its spreads, and sets
+    ust_source to MANUAL_OVERRIDE_SOURCE (in place). Returns True if applied.
+    """
+    finra_date = record["finra_date"]
+    key = finra_date.isoformat() if isinstance(finra_date, date) else finra_date
+    override = MANUAL_OVERRIDES.get(key)
+    if override is None:
+        return False
+    record["ust_5yr"] = override["ust_5yr"]
+    record["ust_10yr"] = override["ust_10yr"]
+    record["ust_source"] = MANUAL_OVERRIDE_SOURCE
+    record["ust_stale"] = False
+    for suffix in ("raw", "normalized"):
+        record[f"par_coupon_{suffix}"] = override["par_coupon"]
+        (
+            record[f"spread_5yr_{suffix}"],
+            record[f"spread_10yr_{suffix}"],
+            record[f"spread_avg_{suffix}"],
+        ) = compute_spreads(override["par_coupon"], override["ust_5yr"], override["ust_10yr"])
+    return True
+
+
+def apply_manual_overrides_to_db(db_path=DEFAULT_DB_PATH):
+    """
+    Applies MANUAL_OVERRIDES to rows already stored, then recomputes QTD for
+    every row from the earliest override date onward (their reference rows
+    may have changed). Returns (rows_overridden, qtd_rows_recomputed).
+    """
+    overridden = 0
+    for key in sorted(MANUAL_OVERRIDES):
+        row = get_day(key, db_path=db_path)
+        if row is None:
+            continue
+        apply_manual_override(row)
+        upsert_day(row, db_path=db_path)
+        overridden += 1
+    if not MANUAL_OVERRIDES:
+        return overridden, 0
+    return overridden, recompute_qtd(min(MANUAL_OVERRIDES), db_path=db_path)
+
+
+def recompute_qtd(start_date, db_path=DEFAULT_DB_PATH):
+    """Recomputes the qtd_* columns for every row on/after start_date. Returns the row count."""
+    if isinstance(start_date, date):
+        start_date = start_date.isoformat()
+    with _connect(db_path) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM daily_spreads WHERE finra_date >= ? ORDER BY finra_date ASC", (start_date,)
+        )]
+    for row in rows:
+        fields = compute_qtd_fields(row, db_path=db_path)
+        set_clause = ", ".join(f"{k}=:{k}" for k in fields)
+        with _connect(db_path) as conn:
+            conn.execute(
+                f"UPDATE daily_spreads SET {set_clause} WHERE finra_date=:finra_date",
+                {**fields, "finra_date": row["finra_date"]},
+            )
+    return len(rows)
+
+
 def fill_missing_qtd(db_path=DEFAULT_DB_PATH):
     """
     Recomputes QTD fields for rows that were written without a prior-quarter

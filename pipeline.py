@@ -28,7 +28,7 @@ from settlement_calendar import (
     CLASS_A_SETTLEMENT_DATES, get_near_month_settlement, get_next_settlement_month, settlement_date_for,
 )
 from treasury_rates import get_treasury_rates
-from db import compute_spreads
+from db import apply_manual_override, compute_spreads
 
 
 def _serialize_curve(curve):
@@ -198,5 +198,9 @@ def build_daily_record(filepath, finra_date=None, allow_yahoo_fallback=True, set
     record["spread_5yr_normalized"] = spread_5yr_norm
     record["spread_10yr_normalized"] = spread_10yr_norm
     record["spread_avg_normalized"] = spread_avg_norm
+
+    # Quarter-end days pinned to externally reported values (see db.MANUAL_OVERRIDES),
+    # so a re-run of those dates keeps the override.
+    apply_manual_override(record)
 
     return record
