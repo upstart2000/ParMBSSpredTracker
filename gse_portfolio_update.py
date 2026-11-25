@@ -72,10 +72,26 @@ def fhlmc_url(year, month):
     return FHLMC_URL_TEMPLATE.format(mm=f"{month:02d}", yy=f"{year % 100:02d}")
 
 
+# Identify the script honestly. Fannie Mae's site (behind Cloudflare) started
+# rejecting the default "python-requests" User-Agent with a 403 challenge page
+# around Oct 2026; a descriptive project UA is served normally.
+USER_AGENT = "ParMBSSpredTracker/1.0 (+https://github.com/upstart2000/ParMBSSpredTracker)"
+
+
 def _download(url):
-    resp = requests.get(url, timeout=30)
-    if resp.status_code != 200:
+    """
+    Returns the PDF bytes, or None if the report isn't published yet (HTTP
+    404 - what both GSEs return for a month not out yet). Anything else (a
+    403 block, 5xx, an HTML page instead of a PDF) raises, so the workflow
+    fails and alerts instead of quietly reporting "not published yet".
+    """
+    resp = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
+    if resp.status_code == 404:
         return None
+    resp.raise_for_status()
+    content_type = resp.headers.get("content-type", "")
+    if "pdf" not in content_type.lower():
+        raise RuntimeError(f"{url} returned {content_type!r} instead of a PDF")
     return resp.content
 
 
@@ -291,9 +307,12 @@ def append_month(year, month, fnma_row, fhlmc_row, csv_path=CSV_PATH):
     out.to_csv(csv_path, index=False)
 
 
-def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
+def update_next_month():
+    """
+    Fetches, validates and appends the month after the CSV's latest one.
+    Returns True if a month was appended, False if it isn't published yet.
+    Exits non-zero if both reports are out but one can't be parsed.
+    """
     year, month = next_target_month()
     label = f"{MONTH_NAMES[month - 1]} {year}"
     logger.info("Checking for %s data", label)
@@ -303,10 +322,10 @@ def main():
 
     if fnma_pdf is None:
         logger.info("Fannie Mae %s report not published yet (%s) - nothing to do.", label, fnma_url(year, month))
-        return
+        return False
     if fhlmc_pdf is None:
         logger.info("Freddie Mac %s report not published yet (%s) - nothing to do.", label, fhlmc_url(year, month))
-        return
+        return False
 
     fnma_row = parse_fnma_table4(fnma_pdf, year, month)
     fhlmc_row = parse_fhlmc_table3(fhlmc_pdf, year, month)
@@ -321,6 +340,15 @@ def main():
 
     append_month(year, month, fnma_row, fhlmc_row)
     logger.info("Appended %s: FNMA=%s FHLMC=%s", label, fnma_row, fhlmc_row)
+    return True
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    # Catch up on every published month in one run (e.g. after a stretch of
+    # failed runs), stopping at the first one not out yet.
+    while update_next_month():
+        pass
 
 
 if __name__ == "__main__":
