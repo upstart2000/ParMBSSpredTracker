@@ -10,6 +10,7 @@ Second tab (GSE Retained Portfolios) reads gse_retained_portfolio.csv - a
 separate, manually-curated dataset (not part of the nightly FINRA/Treasury
 pipeline). See that file's own header for provenance/refresh notes.
 """
+import importlib
 import os
 from datetime import date
 
@@ -18,6 +19,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import db
+
+# Streamlit re-runs this script when it changes but keeps already-imported
+# helper modules cached, so a deploy that adds something to db.py would hit
+# the stale copy (AttributeError) until a manual reboot. Reload it each run.
+db = importlib.reload(db)
 
 # Fixed categorical order (validated for CVD separation - see dataviz skill palette).
 COLOR_SPREAD_5YR = "#2a78d6"   # blue
